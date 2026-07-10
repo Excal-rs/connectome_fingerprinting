@@ -1,0 +1,9 @@
+network,accuracy,n_edges
+Posterior-Mu,0.8289,2926
+Frontopariet,0.6726,1225
+Cingulo-Oper,0.5265,1540
+Visual2,0.4926,1431
+Default,0.4543,253
+Language,0.3584,253
+Somatomotor,0.3451,741
+Auditory,0.1445,105

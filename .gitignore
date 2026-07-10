@@ -1,0 +1,13 @@
+# Raw HCP dataset (~12 GB) — re-downloaded from OSF by analyzer.py
+data/
+
+# Local archive of superseded drafts / course material
+_archive/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# OS / editor cruft
+.DS_Store
