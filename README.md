@@ -12,10 +12,6 @@ Random guessing would be right **1 in 339 ≈ 0.3%**. We reach **91.6%** — and
 push further to ask *which* parts of the brain carry identity, whether it survives
 a change of mental task, and whether smarter people are easier to identify.
 
-It's a biometric **identification / retrieval** problem: high-dimensional features,
-similarity search, careful validation, and honest handling of confounds — describable
-with zero neuroscience.
-
 ---
 
 ## How to run it
