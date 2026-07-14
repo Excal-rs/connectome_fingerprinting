@@ -10,7 +10,7 @@ The companion script `visualiser.py` turns these into the figures, so it can
 run on a clone of the repo without re-downloading the 12 GB dataset.
 
 What it does, start to finish:
-  * downloads the HCP data if it isn't already in ./data (rest ~1.6 GB, task ~1.4 GB)
+  * (the dataset must already be in ./data — run `python download.py` first to fetch it)
   * CORE experiment: brain "fingerprinting" from 31%  ->  92% via three fixes
   * EXTENSION 1 (H3): which brain networks make people most identifiable
   * EXTENSION 2 (H2): does identity survive a change of task (cross-task grid)
@@ -26,7 +26,7 @@ Outputs (into ./results):
 See README.md for the full plain-English explanation of every step.
 ============================================================================
 """
-import os, json, urllib.request, tarfile
+import os, json
 import numpy as np
 
 # ---------------------------------------------------------------------------
@@ -41,31 +41,20 @@ IU = np.triu_indices(N_PARCELS, k=1)   # the 64,620 unique region-pairs = a fing
 people = list(range(N_SUBJECTS))
 TASKS = ["MOTOR", "WM", "EMOTION", "GAMBLING", "LANGUAGE", "RELATIONAL", "SOCIAL"]
 
-OSF = {"hcp_rest": "https://osf.io/bqp7m/download",
-       "hcp_task": "https://osf.io/s4h8j/download"}
-
 
 # ---------------------------------------------------------------------------
-# Data access
+# Data access  (the dataset is fetched separately by download.py)
 # ---------------------------------------------------------------------------
-def ensure(name):
-    """Return path to ./data/<name>, downloading + extracting from OSF if missing."""
+def require(name):
+    """Return path to ./data/<name>, or exit with a hint if it hasn't been fetched yet."""
     d = os.path.join(DATA, name)
-    if os.path.isdir(d):
-        return d
-    os.makedirs(DATA, exist_ok=True)
-    tgz = d + ".tgz"
-    if not os.path.isfile(tgz):
-        print(f"Downloading {name} from OSF (this can take a few minutes)...")
-        urllib.request.urlretrieve(OSF[name], tgz)
-    print(f"Extracting {name}...")
-    with tarfile.open(tgz) as t:
-        t.extractall(DATA)
+    if not os.path.isdir(d):
+        raise SystemExit(f"Missing {d}. Run `python download.py` first to fetch the HCP dataset.")
     return d
 
 
-REST = ensure("hcp_rest")
-TASK = ensure("hcp_task")
+REST = require("hcp_rest")
+TASK = require("hcp_task")
 # brain-network label for each of the 360 regions (column 1 of regions.npy)
 NETWORKS = np.array([str(x) for x in np.load(f"{TASK}/regions.npy", allow_pickle=True)[:, 1]])
 

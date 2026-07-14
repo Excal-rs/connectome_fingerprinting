@@ -23,28 +23,30 @@ with zero neuroscience.
 ```bash
 pip install -r requirements.txt
 
-python analyzer.py     # data → raw results/   (downloads ~3 GB on first run, then a few min of compute)
+python download.py     # OSF → data/       (fetches the full ~12 GB HCP dataset; skips what's already there)
+python analyzer.py     # data → raw results/   (a few minutes of compute)
 python visualiser.py   # results/ → figures/   (seconds; no dataset needed)
 ```
 
-The pipeline is deliberately split into two stages so the figures are decoupled
-from the 12 GB dataset — anyone can clone the repo and reproduce every figure in
-seconds from the committed `results/`, without downloading anything.
+The pipeline is deliberately split into stages so the figures are decoupled from
+the 12 GB dataset — anyone can clone the repo and reproduce every figure in
+seconds from the committed `results/`, without running `download.py` at all.
 
 ### Project structure
 
 ```
+├── download.py          STAGE 0 — fetches the HCP dataset from OSF into data/ (run once)
 ├── analyzer.py          STAGE 1 — loads data, runs every experiment, writes raw results
 ├── visualiser.py        STAGE 2 — reads results/, renders every figure (no dataset access)
 ├── requirements.txt     numpy, scipy, pandas, matplotlib
 ├── results/             raw result files  (committed — small)
 ├── figures/             the figures        (committed)
-└── data/                the 12 GB HCP dataset  (git-ignored; auto-downloaded by analyzer.py)
+└── data/                the 12 GB HCP dataset  (git-ignored; fetched by download.py)
 ```
 
 ### Input files (what `analyzer.py` needs in `data/`)
 
-Downloaded automatically from OSF on first run, into `./data/`:
+Fetched from OSF by `python download.py`, into `./data/`:
 
 | Input | Contents |
 |---|---|
