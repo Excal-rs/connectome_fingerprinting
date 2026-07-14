@@ -47,7 +47,7 @@ def fetch(fname, url, extracted):
     if extracted:
         print(f"  {fname:20s} extracting -> data/{extracted}/")
         with tarfile.open(path) as t:
-            t.extractall(DATA)
+            t.extractall(DATA, filter="data")
 
 
 if __name__ == "__main__":
