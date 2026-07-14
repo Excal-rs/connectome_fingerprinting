@@ -11,3 +11,6 @@ __pycache__/
 
 # OS / editor cruft
 .DS_Store
+
+# Local library cheatsheet (personal notes, not part of the project)
+CHEATSHEET.md

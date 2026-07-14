@@ -1,20 +1,24 @@
 #!/usr/bin/env python3
 """
 ============================================================================
- CONNECTOME FINGERPRINTING — ANALYZER (computation only)
+ CONNECTOME FINGERPRINTING - ANALYZER (computation only)
 ============================================================================
-Run:   python analyzer.py
+Run: `python analyzer.py`
+Prerequisites: `python download.py` must have been ran to download HCP database
 
-Runs the full experiment and writes RAW RESULT FILES only (no figures).
-The companion script `visualiser.py` turns these into the figures, so it can
-run on a clone of the repo without re-downloading the 12 GB dataset.
+This will run the experiment and return raw result files with no visualisation.
+To visualise results, please see `visualiser.py`.
 
 What it does, start to finish:
-  * downloads the HCP data if it isn't already in ./data (rest ~1.6 GB, task ~1.4 GB)
-  * CORE experiment: brain "fingerprinting" from 31%  ->  92% via three fixes
-  * EXTENSION 1 (H3): which brain networks make people most identifiable
-  * EXTENSION 2 (H2): does identity survive a change of task (cross-task grid)
-  * EXTENSION 3: does a person's intelligence affect how identifiable they are
+  - Brain Fingerprinting
+    - Identify people based on their fmri data across multiple dats (91.6% Accuracy)
+  - Which brain network is the most identifiable?
+    - Runs tests on different higher-order networks to check identifiability of different brain regions
+  - Cross task identification
+    - Compute identifiability using data from one task to identify a person on another task
+  - Intelligience Identifiability Correlation
+    - Check is a persons calculated intelligience correlates with identifiability of that person
+
 
 Outputs (into ./results):
   results.json          all scalar results + metadata for every analysis
@@ -26,304 +30,565 @@ Outputs (into ./results):
 See README.md for the full plain-English explanation of every step.
 ============================================================================
 """
-import os, json, urllib.request, tarfile
+
+# Importing External Libraries
+import os, json
+from enum import IntEnum
+from collections.abc import Callable
 import numpy as np
+import pandas as pd
+from scipy import stats
 
 # ---------------------------------------------------------------------------
-# Config
+# Constants and Configuration
 # ---------------------------------------------------------------------------
 DATA = "data"
-OUT = "results"
+OUT  = "results"
 os.makedirs(OUT, exist_ok=True)
-N_SUBJECTS = 339              # subjects in the Neuromatch HCP set
-N_PARCELS = 360               # brain summarised into 360 regions (Glasser atlas)
-IU = np.triu_indices(N_PARCELS, k=1)   # the 64,620 unique region-pairs = a fingerprint
+
+N_SUBJECTS = 339  # Number of subjects in the HCP dataset
+N_REGIONS  = 360  # Dataset summarises brain into N_REGIONS regions
+class Task(IntEnum):
+    # Members act as ints (0..6) in arithmetic, but read as names at call sites,
+    MOTOR      = 0
+    WM         = 1
+    EMOTION    = 2
+    GAMBLING   = 3
+    LANGUAGE   = 4
+    RELATIONAL = 5
+    SOCIAL     = 6
+TASKS = [t.name for t in Task]   # ["MOTOR", "WM", ...] for headers/labels/indexing
+
+IU = np.triu_indices(N_REGIONS, k=1)   # Indicies of the 64,620 unique region-pairs, matrix[IU] can be used to extract only the useful fingerprints
 people = list(range(N_SUBJECTS))
-TASKS = ["MOTOR", "WM", "EMOTION", "GAMBLING", "LANGUAGE", "RELATIONAL", "SOCIAL"]
-
-OSF = {"hcp_rest": "https://osf.io/bqp7m/download",
-       "hcp_task": "https://osf.io/s4h8j/download"}
 
 
 # ---------------------------------------------------------------------------
-# Data access
+# Data access  (the dataset is fetched separately by download.py)
 # ---------------------------------------------------------------------------
-def ensure(name):
-    """Return path to ./data/<name>, downloading + extracting from OSF if missing."""
+def require(name: str) -> str:
+    """Return the path to ./data/<name>, or exit with a hint if it isn't present.
+
+    Args:
+        name: Sub-directory name to look for inside the data folder.
+
+    Returns:
+        The full path to the data directory.
+
+    Raises:
+        SystemExit: If the directory doesn't exist yet.
+    """
     d = os.path.join(DATA, name)
-    if os.path.isdir(d):
-        return d
-    os.makedirs(DATA, exist_ok=True)
-    tgz = d + ".tgz"
-    if not os.path.isfile(tgz):
-        print(f"Downloading {name} from OSF (this can take a few minutes)...")
-        urllib.request.urlretrieve(OSF[name], tgz)
-    print(f"Extracting {name}...")
-    with tarfile.open(tgz) as t:
-        t.extractall(DATA)
+    if not os.path.isdir(d):
+        raise SystemExit(f"Missing {d}. Run `python download.py` first to fetch the HCP dataset.")
     return d
 
 
-REST = ensure("hcp_rest")
-TASK = ensure("hcp_task")
-# brain-network label for each of the 360 regions (column 1 of regions.npy)
-NETWORKS = np.array([str(x) for x in np.load(f"{TASK}/regions.npy", allow_pickle=True)[:, 1]])
+REST = require("hcp_rest")
+TASK = require("hcp_task")
+
+regions = np.load(f"{TASK}/regions.npy", allow_pickle=True)
+network_labels = regions[:, 1]                      
+NETWORKS = network_labels.astype(str) # NETWORKS[I] == Network the `i`th region belongs to
 
 
-def load_rest_run(subject, run):
+def load_rest_run(subject: int, run: int) -> np.ndarray:
+    """Load one resting-state fMRI run for a subject.
+
+    Args:
+        subject: Subject ID, selecting the folder under REST/subjects/.
+        run: Which rest run, 0-indexed (0-3). Mapped to the 1-indexed
+            bold file on disk via `run + 1`.
+
+    Returns:
+        A (N_REGIONS, timepoints) float array - the BOLD signal for each of
+        the 360 regions across the run's timepoints (typically 1200).
+    """
     return np.load(f"{REST}/subjects/{subject}/timeseries/bold{run+1}_Atlas_MSMAll_Glasser360Cortical.npy")
 
 
-def load_task_run(subject, task, run):
-    # each task has two runs; their bold-file numbers are 5 + 2*task + run
+def load_task_run(subject: int, task: Task, run: int) -> np.ndarray:
+    """Load one task fMRI run for a subject.
+
+    Args:
+        subject: Subject ID, selecting the folder under TASK/subjects/.
+        task: Which task to load (a Task enum member, e.g. Task.MOTOR).
+        run: Which of the task's two runs, 0-indexed (0 or 1). Each task
+            occupies two consecutive bold files, so the file number on disk
+            is `5 + 2 * task + run` (bold5 through bold18).
+
+    Returns:
+        A (N_REGIONS, timepoints) float array - the BOLD signal for each of
+        the 360 regions across the run's timepoints.
+    """
     k = 5 + 2 * task + run
     return np.load(f"{TASK}/subjects/{subject}/timeseries/bold{k}_Atlas_MSMAll_Glasser360Cortical.npy")
 
 
-def rest_day(subject, day):
-    # combine a day's two rest runs into one long recording (~2400 timepoints)
+def rest_day(subject: int, day: int) -> np.ndarray:
+    """Combine a day's two rest runs into one long recording.
+
+    Args:
+        subject: Subject ID, passed through to load_rest_run.
+        day: Which scanning day, 0-indexed. Day 0 uses rest runs 0 and 1,
+            day 1 uses runs 2 and 3.
+
+    Returns:
+        A (N_REGIONS, timepoints) float array - the day's two runs
+        concatenated along the time axis (~2400 timepoints).
+    """
     runs = [0, 1] if day == 0 else [2, 3]
     return np.concatenate([load_rest_run(subject, r) for r in runs], axis=1)
 
 
-def load_intelligence():
-    """Per-subject cognitive ('intelligence') score from in-scanner task performance.
+def load_intelligence() -> tuple[np.ndarray, dict[str, np.ndarray]]:
+    """Build a per-subject cognitive ('intelligence') score from in-scanner performance.
 
     There is no IQ field in this anonymised release, so we build a general-cognitive
     composite from three tasks that load heavily on fluid intelligence in the HCP
     literature: working-memory 2-back accuracy, relational-reasoning accuracy, and
-    the adaptive language-math difficulty reached. Each is z-scored and averaged, so
-    the composite is a standardised score (mean 0, higher = better cognitive
-    performance). Returns (composite, subtests-dict), each a length-N_SUBJECTS array.
+    the adaptive language-math difficulty reached. Each subtest is reduced to one
+    number per subject, z-scored, and the three are averaged into a standardised
+    composite (mean 0; higher = better cognitive performance).
+
+    Returns:
+        A 2-tuple of:
+          - composite: a (length - N_SUBJECTS) array, the averaged cognitive score
+            (NaN where a subject is missing data),
+          - subtests: a dict mapping subtest name -> its own (length - N_SUBJECTS) array.
     """
-    import pandas as pd
-    B = os.path.join(DATA, "hcp", "behavior")
+    behavior_dir = os.path.join(DATA, "hcp", "behavior")
 
-    def by_subject(series):
-        return series.reindex(range(N_SUBJECTS)).to_numpy(dtype=float)
+    def align_by_subject(per_subject_score: "pd.Series") -> np.ndarray:
+        # Force one slot per subject 0..N-1 (NaN where missing) so subtests stay aligned.
+        return per_subject_score.reindex(range(N_SUBJECTS)).to_numpy(dtype=float)
 
-    def z(x):
-        return (x - np.nanmean(x)) / np.nanstd(x)
+    def zscore(values: np.ndarray) -> np.ndarray:
+        # Standardise to SD units, ignoring missing subjects.
+        return (values - np.nanmean(values)) / np.nanstd(values)
 
-    wm = pd.read_csv(f"{B}/wm.csv")
-    rel = pd.read_csv(f"{B}/relational.csv")
-    lang = pd.read_csv(f"{B}/language.csv")
+    wm_data         = pd.read_csv(f"{behavior_dir}/wm.csv")
+    relational_data = pd.read_csv(f"{behavior_dir}/relational.csv")
+    language_data   = pd.read_csv(f"{behavior_dir}/language.csv")
 
-    two_back = by_subject(wm[wm.ConditionName.str.startswith("2BK")].groupby("Subject").ACC.mean())
-    relational = by_subject(rel[rel.ConditionName == "REL"].groupby("Subject").ACC.mean())
-    math_diff = by_subject(lang[lang.ConditionName == "MATH"].groupby("Subject").AVG_DIFFICULTY_LEVEL.mean())
+    # Working memory: mean accuracy on the hard 2-back conditions (ignore 0-back baseline).
+    two_back_rows     = wm_data[wm_data.ConditionName.str.startswith("2BK")]
+    two_back_accuracy = align_by_subject(two_back_rows.groupby("Subject").ACC.mean())
 
-    subtests = {"working_memory_2back": two_back, "relational_reasoning": relational,
-                "language_math_difficulty": math_diff}
-    composite = np.nanmean(np.vstack([z(two_back), z(relational), z(math_diff)]), axis=0)
+    # Relational reasoning: mean accuracy on the REL condition (ignore the easier MATCH).
+    relational_rows     = relational_data[relational_data.ConditionName == "REL"]
+    relational_accuracy = align_by_subject(relational_rows.groupby("Subject").ACC.mean())
+
+    # Language: mean adaptive difficulty reached on the MATH condition (harder = better).
+    math_rows       = language_data[language_data.ConditionName == "MATH"]
+    math_difficulty = align_by_subject(math_rows.groupby("Subject").AVG_DIFFICULTY_LEVEL.mean())
+
+    subtests = {"working_memory_2back": two_back_accuracy,
+                "relational_reasoning": relational_accuracy,
+                "language_math_difficulty": math_difficulty}
+
+    # Put the three subtests on a common scale, then average across them per subject.
+    standardised = np.vstack([zscore(two_back_accuracy),
+                              zscore(relational_accuracy),
+                              zscore(math_difficulty)])
+    composite = np.nanmean(standardised, axis=0)
     return composite, subtests
 
 
 # ---------------------------------------------------------------------------
 # The method (four small functions)
 # ---------------------------------------------------------------------------
-def fingerprint(scan):
-    """(360 x time) recording -> one fingerprint (64,620 numbers).
-    Correlation = how much each pair of regions rises and falls together over time."""
-    scan = scan - scan.mean(axis=1, keepdims=True)
-    grid = np.corrcoef(scan)
-    grid = np.arctanh(np.clip(grid, -0.999999, 0.999999))   # Fisher-z rescaling
-    return grid[IU]
+def fingerprint(timeseries: np.ndarray) -> np.ndarray:
+    """Turn one (regions x time) recording into that session's connectome fingerprint.
+
+    The fingerprint is the brain's correlation structure: for every pair of the 360
+    regions, how strongly their activity rises and falls together across the scan.
+    That grid is symmetric, so only its upper triangle is kept (see IU), giving a
+    flat signature that can be compared against other sessions and people.
+
+    Args:
+        timeseries: A (N_REGIONS, timepoints) array of BOLD signal, e.g. from
+            load_rest_run / load_task_run.
+
+    Returns:
+        A 1-D array of 64,620 Fisher-z-transformed correlations - the unique
+        region-pair values from the upper triangle. One person, one session.
+    """
+    centered = timeseries - timeseries.mean(axis=1, keepdims=True)      # per-region: remove baseline level
+    connectome = np.corrcoef(centered)                                  # 360x360 region-by-region correlations
+    connectome = np.arctanh(np.clip(connectome, -0.999999, 0.999999))   # Fisher-z rescale (clip keeps arctanh finite)
+    return connectome[IU]
 
 
-def build(load_fn):
-    """Stack everyone's fingerprints into one table (people x 64,620)."""
-    return np.vstack([fingerprint(load_fn(s)) for s in people])
+def build(load_scan: Callable[[int], np.ndarray]) -> np.ndarray:
+    """Stack every subject's fingerprint into one table for a session.
+
+    Args:
+        load_scan: A function mapping a subject ID to their (N_REGIONS, timepoints)
+            recording, e.g. `lambda s: load_rest_run(s, 0)`. Passing it in is what
+            lets the same builder serve rest runs, task runs, or whole days.
+
+    Returns:
+        A (N_SUBJECTS, 64,620) array - one row per subject (ordered as in `people`),
+        each row the fingerprint from fingerprint().
+    """
+    return np.vstack([fingerprint(load_scan(subject)) for subject in people])
 
 
-def remove_backbone(F):
-    """Subtract the group-average fingerprint (the 'generic brain'), leaving each
-    person's personal deviation. Unsupervised, per-session, leak-free."""
-    return F - F.mean(axis=0, keepdims=True)
+def remove_backbone(fingerprints: np.ndarray) -> np.ndarray:
+    """Subtract the group-average fingerprint (the 'generic brain') from each subject.
+
+    Most of any fingerprint is structure shared by all human brains - nearly identical
+    across people and so useless for telling them apart. Removing the per-session
+    average leaves only each subject's personal deviation, which sharpens
+    identification. It uses no labels and is recomputed per session, so it is
+    unsupervised and leak-free.
+
+    Args:
+        fingerprints: A (N_SUBJECTS, 64,620) table for one session, as built by build().
+
+    Returns:
+        A (N_SUBJECTS, 64,620) array of the same shape, each row now the subject's
+        deviation from the group mean (every column mean-centred across subjects).
+    """
+    return fingerprints - fingerprints.mean(axis=0, keepdims=True)
 
 
-def similarity(A, B):
-    """339x339 grid: correlation between every A-fingerprint and every B-fingerprint."""
-    Az = (A - A.mean(1, keepdims=True)) / A.std(1, keepdims=True)
-    Bz = (B - B.mean(1, keepdims=True)) / B.std(1, keepdims=True)
-    return Az @ Bz.T / A.shape[1]
+def similarity(fingerprints_a: np.ndarray, fingerprints_b: np.ndarray) -> np.ndarray:
+    """Correlate every fingerprint in one session against every fingerprint in another.
+
+    Typically A is day 1 and B is day 2. Each fingerprint is z-scored first, so a dot
+    product between two rows is their Pearson correlation. Identification succeeds when
+    a subject's own across-session entry (on the diagonal) is their strongest match.
+
+    Args:
+        fingerprints_a: A (N_SUBJECTS, 64,620) table for session A.
+        fingerprints_b: A (N_SUBJECTS, 64,620) table for session B (same subject order).
+
+    Returns:
+        A (N_SUBJECTS, N_SUBJECTS) correlation grid where entry [i, j] is the
+        similarity between subject i in session A and subject j in session B.
+    """
+    a_z = (fingerprints_a - fingerprints_a.mean(1, keepdims=True)) / fingerprints_a.std(1, keepdims=True)
+    b_z = (fingerprints_b - fingerprints_b.mean(1, keepdims=True)) / fingerprints_b.std(1, keepdims=True)
+    return a_z @ b_z.T / fingerprints_a.shape[1]
 
 
-def accuracy(S):
-    """Fraction of people correctly identified (best-match guess), averaged both directions."""
-    t = np.arange(S.shape[0])
-    return ((S.argmax(1) == t).mean() + (S.argmax(0) == t).mean()) / 2
+def accuracy(similarity_matrix: np.ndarray) -> float:
+    """Fraction of subjects correctly re-identified by best match, averaged both ways.
+
+    Each subject's guess is the row/column with the highest similarity to them; the
+    guess is correct when that best match is the same subject (i.e. on the diagonal).
+    The two directions (A->B and B->A) are averaged so the score is symmetric.
+
+    Args:
+        similarity_matrix: A square (N_SUBJECTS, N_SUBJECTS) grid from similarity(),
+            with matching subject order on both axes.
+
+    Returns:
+        A single accuracy in [0, 1] - the mean fraction of subjects whose strongest
+        match is themselves (1 / N_SUBJECTS would be chance).
+    """
+    truth  = np.arange(similarity_matrix.shape[0])
+    a_to_b = (similarity_matrix.argmax(1) == truth).mean()   # for each session-A subject, is their top B-match themselves?
+    b_to_a = (similarity_matrix.argmax(0) == truth).mean()   # same, the other direction
+    return float((a_to_b + b_to_a) / 2)
 
 
 # ===========================================================================
-# CORE EXPERIMENT — 31% -> 92%
+# CORE EXPERIMENT - Naive, Fix 1 + 2, Fix 1 + 2 + 3
 # ===========================================================================
-def run_core():
+def run_core() -> tuple[dict, np.ndarray, np.ndarray, np.ndarray]:
+    """Reproduce the core fingerprinting result, from a naive baseline to the full method.
+
+    Runs identification three ways on resting-state data and prints each accuracy:
+      * naive: a single short scan per session (weak baseline)
+      * Fix 1 & 2: a whole day of rest (both runs concatenated, phase-encoding balanced)
+      * Fix 3: additionally remove the group-average 'backbone' (remove_backbone)
+    Also saves the day-1-vs-day-2 similarity matrix, the one heavy artifact the figures need.
+
+    Returns:
+        A 4-tuple of:
+          * a dict of the four scalar accuracies (chance, naive, fix12, fix123),
+          * day1_deviations, day2_deviations: the (N_SUBJECTS, 64,620) backbone-removed
+            fingerprint tables for each day,
+          * similarity_matrix: the (N_SUBJECTS, N_SUBJECTS) day-1-vs-day-2 grid.
+        The latter three are handed on to the extension analyses.
+    """
     print("\n=== CORE: from a naive attempt to a strong result ===")
     chance = 1 / N_SUBJECTS
 
     # Naive: a single short scan per session
-    before = accuracy(similarity(build(lambda s: load_rest_run(s, 0)),
-                                 build(lambda s: load_rest_run(s, 2))))
+    naive_accuracy = accuracy(similarity(build(lambda s: load_rest_run(s, 0)),
+                                         build(lambda s: load_rest_run(s, 2))))
 
-    # Fix 1 & 2: a full day of data (both runs glued; phase-encoding balanced)
-    day1 = build(lambda s: rest_day(s, 0))
-    day2 = build(lambda s: rest_day(s, 1))
-    fix12 = accuracy(similarity(day1, day2))
+    # Fix 1 & 2: a full day of data (both runs glued, phase-encoding balanced)
+    day1_fingerprints = build(lambda s: rest_day(s, 0))
+    day2_fingerprints = build(lambda s: rest_day(s, 1))
+    fullday_accuracy = accuracy(similarity(day1_fingerprints, day2_fingerprints))
 
     # Fix 3: also remove the generic brain
-    d1, d2 = remove_backbone(day1), remove_backbone(day2)
-    S = similarity(d1, d2)
-    fix123 = accuracy(S)
+    day1_deviations = remove_backbone(day1_fingerprints)
+    day2_deviations = remove_backbone(day2_fingerprints)
+    similarity_matrix = similarity(day1_deviations, day2_deviations)
+    backbone_accuracy = accuracy(similarity_matrix)
 
-    print(f"  chance                 : {chance:.3%}")
-    print(f"  naive (single scan)    : {before:.1%}")
-    print(f"  + Fix 1 & 2 (full day) : {fix12:.1%}")
-    print(f"  + Fix 3 (backbone)     : {fix123:.1%}")
+    print(f"chance                 : {chance:.3%}")
+    print(f"naive (single scan)    : {naive_accuracy:.1%}")
+    print(f"+ Fix 1 & 2 (full day) : {fullday_accuracy:.1%}")
+    print(f"+ Fix 3 (backbone)     : {backbone_accuracy:.1%}")
 
     # the similarity matrix is the one heavy artifact the figures need
-    np.save(f"{OUT}/similarity_matrix.npy", S.astype(np.float32))
+    np.save(f"{OUT}/similarity_matrix.npy", similarity_matrix.astype(np.float32))
 
-    return {"chance": chance, "naive": before, "fix12": fix12, "fix123": fix123}, d1, d2, S
+    return ({"chance": chance, "naive": naive_accuracy, "fix12": fullday_accuracy, "fix123": backbone_accuracy},
+            day1_deviations, day2_deviations, similarity_matrix)
 
 
 # ===========================================================================
-# EXTENSION 1 (H3) — which networks fingerprint best
+# EXTENSION 1 (H3) - which networks fingerprint best
 # ===========================================================================
-def run_networks(d1, d2):
+def run_networks(day1_deviations: np.ndarray, day2_deviations: np.ndarray) -> dict:
+    """Measure identification accuracy using only the edges within each brain network.
+
+    Every fingerprint edge links two regions; an edge sits 'inside' a network when both
+    of its endpoint regions belong to that network. Restricting the fingerprint to a
+    network's internal edges and re-running identification reveals which networks carry
+    the most identifying information. Networks with fewer than 50 internal edges are
+    skipped as too small to be reliable. Writes per_network.csv.
+
+    Args:
+        day1_deviations: (N_SUBJECTS, 64,620) backbone-removed fingerprints, day 1.
+        day2_deviations: the same for day 2.
+
+    Returns:
+        A dict mapping network name -> identification accuracy, for the networks that
+        cleared the 50-edge minimum.
+    """
     print("\n=== EXTENSION 1 (H3): identifiability by brain network ===")
-    eA, eB = NETWORKS[IU[0]], NETWORKS[IU[1]]
-    scores, edge_counts = {}, {}
-    for net in sorted(set(NETWORKS)):
-        inside = (eA == net) & (eB == net)
-        if inside.sum() < 50:
+
+    # Label each of the 64,620 fingerprint edges by the network of its two endpoint regions.
+    # IU[0]/IU[1] hold the two region indices per edge, in the same order as the fingerprint.
+    endpoint_a_network = NETWORKS[IU[0]]
+    endpoint_b_network = NETWORKS[IU[1]]
+
+    # For each network, keep only its internal edges and re-run the full identification.
+    network_accuracy, network_edge_count = {}, {}
+    for network in sorted(set(NETWORKS)):
+        within_network = (endpoint_a_network == network) & (endpoint_b_network == network)
+        if within_network.sum() < 50:          # too few edges to give a stable estimate
             continue
-        scores[net] = accuracy(similarity(d1[:, inside], d2[:, inside]))
-        edge_counts[net] = int(inside.sum())
-    for net, a in sorted(scores.items(), key=lambda kv: -kv[1]):
-        print(f"  {net:14s} {a:5.1%}  ({edge_counts[net]} connections)")
+        network_accuracy[network] = accuracy(similarity(day1_deviations[:, within_network],
+                                                        day2_deviations[:, within_network]))
+        network_edge_count[network] = int(within_network.sum())
 
-    with open(f"{OUT}/per_network.csv", "w") as f:
-        f.write("network,accuracy,n_edges\n")
-        for net, a in sorted(scores.items(), key=lambda kv: -kv[1]):
-            f.write(f"{net},{a:.4f},{edge_counts[net]}\n")
+    # Report and persist, most identifiable network first.
+    ranked = sorted(network_accuracy.items(), key=lambda kv: -kv[1])
+    for network, acc in ranked:
+        print(f"  {network:14s} {acc:5.1%}  ({network_edge_count[network]} connections)")
 
-    return scores
+    with open(f"{OUT}/per_network.csv", "w") as csv_file:
+        csv_file.write("network,accuracy,n_edges\n")
+        for network, acc in ranked:
+            csv_file.write(f"{network},{acc:.4f},{network_edge_count[network]}\n")
+
+    return network_accuracy
 
 
 # ===========================================================================
-# EXTENSION 3 — does a person's intelligence affect how identifiable they are?
+# EXTENSION 3 - does a person's intelligence affect how identifiable they are?
 # ===========================================================================
-def run_intelligence(S):
+def compute_self_identifiability(similarity_matrix: np.ndarray) -> np.ndarray:
+    """Per-subject distinctiveness: how far each subject's own match sits above impostors.
+
+    For subject i the 'self match' is the diagonal entry (their day-1 vs day-2 similarity).
+    The impostors are the off-diagonal entries in that subject's row (querying day 1 against
+    everyone's day 2) and column (the reverse). We z-score the self match against the
+    impostor cloud in each direction and average the two, giving a graded score in SD units
+    (higher = more uniquely identifiable) rather than a plain yes/no.
+
+    Args:
+        similarity_matrix: the (N_SUBJECTS, N_SUBJECTS) cross-day grid from run_core.
+
+    Returns:
+        A length-N_SUBJECTS array of distinctiveness scores, in standard deviations.
+    """
+    off_diagonal = ~np.eye(N_SUBJECTS, dtype=bool)    # True everywhere except the self-matches
+    self_match = np.diag(similarity_matrix)           # each subject's own across-day similarity
+
+    # Impostor cloud stats, treating each subject first as a day-1 query (their row)...
+    row_impostor_mean = np.array([similarity_matrix[i, off_diagonal[i]].mean() for i in range(N_SUBJECTS)])
+    row_impostor_std  = np.array([similarity_matrix[i, off_diagonal[i]].std()  for i in range(N_SUBJECTS)])
+    # ...then as a day-2 query (their column).
+    col_impostor_mean = np.array([similarity_matrix[off_diagonal[:, j], j].mean() for j in range(N_SUBJECTS)])
+    col_impostor_std  = np.array([similarity_matrix[off_diagonal[:, j], j].std()  for j in range(N_SUBJECTS)])
+
+    # Self match's distance above the impostors, in SDs, averaged over both directions.
+    return 0.5 * ((self_match - row_impostor_mean) / row_impostor_std
+                  + (self_match - col_impostor_mean) / col_impostor_std)
+
+
+def compute_identified(similarity_matrix: np.ndarray) -> np.ndarray:
+    """Per-subject boolean: was this subject the top match in BOTH directions?
+
+    Args:
+        similarity_matrix: the (N_SUBJECTS, N_SUBJECTS) cross-day grid from run_core.
+
+    Returns:
+        A length-N_SUBJECTS boolean array, True where the subject is their own best match
+        both when querying day 1 -> day 2 and day 2 -> day 1.
+    """
+    truth = np.arange(N_SUBJECTS)
+    row_correct = similarity_matrix.argmax(1) == truth   # best day-2 match for each day-1 subject
+    col_correct = similarity_matrix.argmax(0) == truth   # best day-1 match for each day-2 subject
+    return row_correct & col_correct
+
+
+def run_intelligence(similarity_matrix: np.ndarray) -> dict:
     """Test whether more (cognitively) able people are easier to fingerprint.
 
-    Per person we measure identifiability from the day-1 vs day-2 rest similarity
+    Per subject we measure identifiability from the day-1 vs day-2 rest similarity
     matrix in two ways:
-      * self-identifiability (continuous): how far a person's own across-day match
+      * self-identifiability (continuous): how far a subject's own across-day match
         stands above the crowd of impostor matches, in SDs -> a graded 'distinctiveness'
-      * identified correctly (binary): were they the top match (averaged both directions)
-    Then we correlate each against the cognitive composite (Pearson + Spearman for the
-    continuous score, point-biserial for the binary one).
+      * identified correctly (binary): were they the top match in both directions
+    Each is then correlated against the cognitive composite (Pearson + Spearman for the
+    continuous score, point-biserial for the binary one), plus a per-subtest Pearson.
+    Writes intelligence.csv.
+
+    Args:
+        similarity_matrix: the (N_SUBJECTS, N_SUBJECTS) day-1-vs-day-2 grid from run_core.
+
+    Returns:
+        A dict of the correlation statistics, sample sizes, group mean IQs, and the
+        per-subtest correlations.
     """
-    from scipy import stats
     print("\n=== EXTENSION 3: identifiability vs intelligence ===")
-    iq, subtests = load_intelligence()
+    intelligence, subtests = load_intelligence()
 
-    N = S.shape[0]
-    off = ~np.eye(N, dtype=bool)
+    # Two identifiability measures per subject: a graded score and a strict yes/no.
+    self_identifiability = compute_self_identifiability(similarity_matrix)
+    identified = compute_identified(similarity_matrix)
 
-    # self-identifiability: within-match distance above the impostor cloud, in SDs.
-    # Averaged over both directions (day1->day2 query and day2->day1 query).
-    within = np.diag(S)
-    row_imp_mean = np.array([S[i, off[i]].mean() for i in range(N)])
-    row_imp_std = np.array([S[i, off[i]].std() for i in range(N)])
-    col_imp_mean = np.array([S[off[:, j], j].mean() for j in range(N)])
-    col_imp_std = np.array([S[off[:, j], j].std() for j in range(N)])
-    self_id = 0.5 * ((within - row_imp_mean) / row_imp_std + (within - col_imp_mean) / col_imp_std)
+    # Correlate each measure against the cognitive composite, over subjects that have one.
+    # (Pearson + Spearman suit the continuous score; point-biserial suits the binary one.)
+    has_intelligence = np.isfinite(intelligence)
+    pearson_r, pearson_p = stats.pearsonr(intelligence[has_intelligence], self_identifiability[has_intelligence])
+    spearman_rho, spearman_p = stats.spearmanr(intelligence[has_intelligence], self_identifiability[has_intelligence])
+    pointbiserial_r, pointbiserial_p = stats.pointbiserialr(identified[has_intelligence].astype(float),
+                                                            intelligence[has_intelligence])
+    iq_identified = intelligence[has_intelligence & identified]
+    iq_missed     = intelligence[has_intelligence & ~identified]
 
-    # identified correctly: top match in each direction, averaged -> {0, 0.5, 1}
-    t = np.arange(N)
-    correct_rate = 0.5 * ((S.argmax(1) == t).astype(float) + (S.argmax(0) == t).astype(float))
-    identified = correct_rate == 1.0   # correct in both directions
+    print(f"  self-identifiability vs IQ : Pearson r = {pearson_r:+.3f} (p = {pearson_p:.3g}) | "
+          f"Spearman rho = {spearman_rho:+.3f} (p = {spearman_p:.3g})")
+    print(f"  identified-correctly vs IQ : point-biserial r = {pointbiserial_r:+.3f} (p = {pointbiserial_p:.3g})")
+    print(f"  mean IQ  identified={iq_identified.mean():+.3f} (n={iq_identified.size})  "
+          f"missed={iq_missed.mean() if iq_missed.size else float('nan'):+.3f} (n={iq_missed.size})")
 
-    valid = np.isfinite(iq)
-    rP, pP = stats.pearsonr(iq[valid], self_id[valid])
-    rS, pS = stats.spearmanr(iq[valid], self_id[valid])
-    rB, pB = stats.pointbiserialr(identified[valid].astype(float), iq[valid])
-    hi = iq[valid & identified]; lo = iq[valid & ~identified]
-    print(f"  self-identifiability vs IQ : Pearson r = {rP:+.3f} (p = {pP:.3g}) | "
-          f"Spearman rho = {rS:+.3f} (p = {pS:.3g})")
-    print(f"  identified-correctly vs IQ : point-biserial r = {rB:+.3f} (p = {pB:.3g})")
-    print(f"  mean IQ  identified={hi.mean():+.3f} (n={hi.size})  "
-          f"missed={lo.mean() if lo.size else float('nan'):+.3f} (n={lo.size})")
+    # Break the continuous relationship down by individual subtest.
     print("  per-subtest Pearson r with self-identifiability:")
-    subtest_r = {}
-    for name, sc in subtests.items():
-        v = valid & np.isfinite(sc)
-        r, p = stats.pearsonr(sc[v], self_id[v])
-        subtest_r[name] = {"r": float(r), "p": float(p)}
-        print(f"    {name:26s} r = {r:+.3f} (p = {p:.3g})")
+    subtest_correlations = {}
+    for subtest_name, subtest_scores in subtests.items():
+        valid_subtest = has_intelligence & np.isfinite(subtest_scores)
+        r, p = stats.pearsonr(subtest_scores[valid_subtest], self_identifiability[valid_subtest])
+        subtest_correlations[subtest_name] = {"r": float(r), "p": float(p)}
+        print(f"    {subtest_name:26s} r = {r:+.3f} (p = {p:.3g})")
 
-    with open(f"{OUT}/intelligence.csv", "w") as f:
-        f.write("subject,intelligence_composite,self_identifiability,identified_correctly\n")
-        for i in range(N):
-            f.write(f"{i},{iq[i]:.4f},{self_id[i]:.4f},{int(identified[i])}\n")
+    # One row per subject for downstream plotting.
+    with open(f"{OUT}/intelligence.csv", "w") as csv_file:
+        csv_file.write("subject,intelligence_composite,self_identifiability,identified_correctly\n")
+        for i in range(N_SUBJECTS):
+            csv_file.write(f"{i},{intelligence[i]:.4f},{self_identifiability[i]:.4f},{int(identified[i])}\n")
 
-    return {"pearson_r": float(rP), "pearson_p": float(pP),
-            "spearman_rho": float(rS), "spearman_p": float(pS),
-            "pointbiserial_r": float(rB), "pointbiserial_p": float(pB),
-            "n": int(valid.sum()), "n_identified": int(identified[valid].sum()),
-            "n_missed": int((~identified[valid]).sum()),
-            "mean_iq_identified": float(hi.mean()),
-            "mean_iq_missed": float(lo.mean()) if lo.size else None,
-            "subtests": subtest_r}
+    return {"pearson_r": float(pearson_r), "pearson_p": float(pearson_p),
+            "spearman_rho": float(spearman_rho), "spearman_p": float(spearman_p),
+            "pointbiserial_r": float(pointbiserial_r), "pointbiserial_p": float(pointbiserial_p),
+            "n": int(has_intelligence.sum()), "n_identified": int(identified[has_intelligence].sum()),
+            "n_missed": int((~identified[has_intelligence]).sum()),
+            "mean_iq_identified": float(iq_identified.mean()),
+            "mean_iq_missed": float(iq_missed.mean()) if iq_missed.size else None,
+            "subtests": subtest_correlations}
 
 
 # ===========================================================================
-# EXTENSION 2 (H2) — cross-task identification + SPECIALISATION analysis
+# EXTENSION 2 (H2) - cross-task identification + SPECIALISATION analysis
 # ===========================================================================
-def run_cross_task():
+def build_task_fingerprints(run: int) -> list[np.ndarray]:
+    """Backbone-removed fingerprint table for the given run of every task.
+
+    Args:
+        run: which of each task's two runs to load (0 or 1).
+
+    Returns:
+        A list of one (N_SUBJECTS, 64,620) float32 table per task, ordered as in Task.
+    """
+    # t=t binds the current task into each lambda (else every lambda would see the last t).
+    return [remove_backbone(build(lambda s, t=t: load_task_run(s, t, run))).astype(np.float32) for t in Task]
+
+
+def run_cross_task() -> dict:
+    """Identify subjects across tasks, and test whether accuracy tracks scan length.
+
+    Builds a backbone-removed fingerprint per subject for each task's two runs, then
+    fills a 7x7 grid: entry [i, j] is the accuracy of using task-i run-0 to identify
+    subjects in task-j run-1. The diagonal is same-task identification; the off-diagonal
+    is cross-task (generalising across mental states). A SPECIALISATION check then
+    correlates each task's own-task accuracy against its scan length, to show accuracy
+    reflects the type of processing rather than merely how much data was collected.
+    Writes cross_task_grid.csv.
+
+    Returns:
+        A dict with the full grid, the mean same-task and cross-task accuracies, the
+        per-task diagonal accuracies and scan lengths, and the accuracy-vs-length r.
+    """
     print("\n=== EXTENSION 2 (H2): cross-task identification ===")
-    runA = [remove_backbone(build(lambda s, t=t: load_task_run(s, t, 0))).astype(np.float32) for t in range(7)]
-    runB = [remove_backbone(build(lambda s, t=t: load_task_run(s, t, 1))).astype(np.float32) for t in range(7)]
-    grid = np.array([[accuracy(similarity(runA[i], runB[j])) for j in range(7)] for i in range(7)])
 
-    same = float(np.mean(np.diag(grid)))
-    diff = float(grid[~np.eye(7, dtype=bool)].mean())
-    print(f"  same task (diagonal)     : {same:.1%}")
-    print(f"  different task (off-diag): {diff:.1%}  vs chance {1/N_SUBJECTS:.2%}")
+    # Fill the 7x7 grid: identify run-0 of task i among run-1 of task j.
+    run0_by_task = build_task_fingerprints(0)
+    run1_by_task = build_task_fingerprints(1)
+    accuracy_grid = np.array([[accuracy(similarity(run0_by_task[i], run1_by_task[j])) for j in Task] for i in Task])
 
-    np.savetxt(f"{OUT}/cross_task_grid.csv", grid, delimiter=",",
+    # Same task = diagonal; cross task = everything off the diagonal.
+    same_task_acc = float(np.mean(np.diag(accuracy_grid)))
+    cross_task_acc = float(accuracy_grid[~np.eye(len(Task), dtype=bool)].mean())
+    print(f"  same task (diagonal)     : {same_task_acc:.1%}")
+    print(f"  different task (off-diag): {cross_task_acc:.1%}  vs chance {1/N_SUBJECTS:.2%}")
+
+    np.savetxt(f"{OUT}/cross_task_grid.csv", accuracy_grid, delimiter=",",
                header=",".join(TASKS), comments="")
 
-    # ---- SPECIALISATION: is within-task accuracy explained by scan length? ----
-    diag = np.diag(grid)
-    lengths = np.array([load_task_run(0, t, 0).shape[1] for t in range(7)])  # timepoints per task
-    r = float(np.corrcoef(lengths, diag)[0, 1])
-    print(f"\n  within-task accuracy vs scan length: correlation r = {r:.2f}")
+    # SPECIALISATION: is a task's own-task accuracy just explained by how long its scan was?
+    # A weak correlation argues accuracy reflects the *type* of processing, not sheer data.
+    within_task_acc = np.diag(accuracy_grid)
+    scan_lengths = np.array([load_task_run(0, t, 0).shape[1] for t in Task])  # timepoints per task
+    length_corr = float(np.corrcoef(scan_lengths, within_task_acc)[0, 1])
+    print(f"\n  within-task accuracy vs scan length: correlation r = {length_corr:.2f}")
     print("  (weak -> accuracy is NOT just 'more data'; it tracks the type of processing)")
-    for t in np.argsort(-diag):
-        print(f"    {TASKS[t]:11s} {diag[t]:5.1%}   ({lengths[t]} timepoints)")
+    for task_idx in np.argsort(-within_task_acc):   # best-identified task first
+        print(f"    {TASKS[task_idx]:11s} {within_task_acc[task_idx]:5.1%}   ({scan_lengths[task_idx]} timepoints)")
 
-    return {"grid": grid.tolist(), "same_task": same, "cross_task": diff,
-            "diag": {TASKS[t]: float(diag[t]) for t in range(7)},
-            "lengths": {TASKS[t]: int(lengths[t]) for t in range(7)},
-            "accuracy_vs_length_r": r}
+    return {"grid": accuracy_grid.tolist(), "same_task": same_task_acc, "cross_task": cross_task_acc,
+            "diag": {TASKS[t]: float(within_task_acc[t]) for t in Task},
+            "lengths": {TASKS[t]: int(scan_lengths[t]) for t in Task},
+            "accuracy_vs_length_r": length_corr}
 
 
 # ===========================================================================
-if __name__ == "__main__":
-    core, d1, d2, S = run_core()
-    nets = run_networks(d1, d2)
-    intel = run_intelligence(S)
-    cross = run_cross_task()
 
-    results = {"core": core,
-               "networks": {k: float(v) for k, v in nets.items()},
-               "intelligence": intel,
-               "cross_task": cross}
-    with open(f"{OUT}/results.json", "w") as f:
-        json.dump(results, f, indent=2)
+
+if __name__ == "__main__":
+    core_results, day1_deviations, day2_deviations, similarity_matrix = run_core()
+    network_results = run_networks(day1_deviations, day2_deviations)
+    intelligence_results = run_intelligence(similarity_matrix)
+    cross_task_results = run_cross_task()
+
+    results = {"core": core_results,
+               "networks": {name: float(acc) for name, acc in network_results.items()},
+               "intelligence": intelligence_results,
+               "cross_task": cross_task_results}
+    with open(f"{OUT}/results.json", "w") as results_file:
+        json.dump(results, results_file, indent=2)
 
     print(f"\nDone. Raw results written to ./{OUT}/")
     print("  results.json, per_network.csv, intelligence.csv, cross_task_grid.csv, similarity_matrix.npy")
