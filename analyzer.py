@@ -12,6 +12,8 @@ To visualise results, please see `visualiser.py`.
 What it does, start to finish:
   - Brain Fingerprinting
     - Identify people based on their fmri data across multiple dats (91.6% Accuracy)
+  - Permutation test
+    - Estimate the chance level empirically by shuffling subject identities
   - Which brain network is the most identifiable?
     - Runs tests on different higher-order networks to check identifiability of different brain regions
   - Cross task identification
@@ -26,6 +28,7 @@ Outputs (into ./results):
   intelligence.csv      per-subject intelligence composite + identifiability
   cross_task_grid.csv   7x7 cross-task identification accuracy grid
   similarity_matrix.npy 339x339 day1-vs-day2 similarity matrix (backbone removed)
+  null_distribution.npy the 5,000 permutation accuracies (empirical null)
 
 See README.md for the full plain-English explanation of every step.
 ============================================================================
@@ -295,21 +298,57 @@ def accuracy(similarity_matrix: np.ndarray) -> float:
     return float((a_to_b + b_to_a) / 2)
 
 
+def permutation_test(similarity_matrix: np.ndarray, n_perm: int = 5000,
+                     seed: int = 42) -> tuple[float, np.ndarray, float]:
+    """Estimate the significance of a fingerprinting accuracy with a permutation test.
+
+    Rather than comparing the observed accuracy only with the analytical chance level
+    (1 / number of subjects), this builds an empirical null distribution directly from
+    the data. Under the null hypothesis that subject identity carries no information,
+    the correspondence between day 1 and day 2 is broken by randomly permuting the
+    columns of the similarity matrix, and the accuracy is recalculated after each
+    shuffle. Repeating this many times gives the distribution of accuracies expected by
+    chance, against which the observed accuracy yields a permutation p-value.
+
+    Args:
+        similarity_matrix: the (N_SUBJECTS, N_SUBJECTS) day-1-vs-day-2 grid.
+        n_perm: number of random permutations used to estimate the null distribution.
+        seed: random seed, for reproducibility.
+
+    Returns:
+        A 3-tuple of:
+          * observed_accuracy: accuracy using the correct subject identities,
+          * null_distribution: a length-n_perm array, the accuracy of each permutation,
+          * p_value: the empirical permutation p-value.
+    """
+    rng = np.random.default_rng(seed)
+    observed_accuracy = accuracy(similarity_matrix)
+    n = similarity_matrix.shape[0]
+
+    null_distribution = np.zeros(n_perm)
+    for i in range(n_perm):
+        shuffled_cols = rng.permutation(n)                  # randomly shuffle day-2 subject identities
+        null_distribution[i] = accuracy(similarity_matrix[:, shuffled_cols])
+
+    p = (1 + np.sum(null_distribution >= observed_accuracy)) / (n_perm + 1)
+    return observed_accuracy, null_distribution, float(p)
+
+
 # ===========================================================================
-# CORE EXPERIMENT - Naive, Fix 1 + 2, Fix 1 + 2 + 3
+# CORE EXPERIMENT - Naive, + Fix 1, + Fix 2
 # ===========================================================================
 def run_core() -> tuple[dict, np.ndarray, np.ndarray, np.ndarray]:
     """Reproduce the core fingerprinting result, from a naive baseline to the full method.
 
     Runs identification three ways on resting-state data and prints each accuracy:
       * naive: a single short scan per session (weak baseline)
-      * Fix 1 & 2: a whole day of rest (both runs concatenated, phase-encoding balanced)
-      * Fix 3: additionally remove the group-average 'backbone' (remove_backbone)
+      * Fix 1: a whole day of rest (both runs concatenated, phase-encoding balanced)
+      * Fix 2: additionally remove the group-average 'backbone' (remove_backbone)
     Also saves the day-1-vs-day-2 similarity matrix, the one heavy artifact the figures need.
 
     Returns:
         A 4-tuple of:
-          * a dict of the four scalar accuracies (chance, naive, fix12, fix123),
+          * a dict of the four scalar accuracies (chance, naive, fix1, fix2),
           * day1_deviations, day2_deviations: the (N_SUBJECTS, 64,620) backbone-removed
             fingerprint tables for each day,
           * similarity_matrix: the (N_SUBJECTS, N_SUBJECTS) day-1-vs-day-2 grid.
@@ -322,12 +361,12 @@ def run_core() -> tuple[dict, np.ndarray, np.ndarray, np.ndarray]:
     naive_accuracy = accuracy(similarity(build(lambda s: load_rest_run(s, 0)),
                                          build(lambda s: load_rest_run(s, 2))))
 
-    # Fix 1 & 2: a full day of data (both runs glued, phase-encoding balanced)
+    # Fix 1: a full day of data (both runs glued, phase-encoding balanced)
     day1_fingerprints = build(lambda s: rest_day(s, 0))
     day2_fingerprints = build(lambda s: rest_day(s, 1))
     fullday_accuracy = accuracy(similarity(day1_fingerprints, day2_fingerprints))
 
-    # Fix 3: also remove the generic brain
+    # Fix 2: also remove the generic brain
     day1_deviations = remove_backbone(day1_fingerprints)
     day2_deviations = remove_backbone(day2_fingerprints)
     similarity_matrix = similarity(day1_deviations, day2_deviations)
@@ -335,14 +374,51 @@ def run_core() -> tuple[dict, np.ndarray, np.ndarray, np.ndarray]:
 
     print(f"chance                 : {chance:.3%}")
     print(f"naive (single scan)    : {naive_accuracy:.1%}")
-    print(f"+ Fix 1 & 2 (full day) : {fullday_accuracy:.1%}")
-    print(f"+ Fix 3 (backbone)     : {backbone_accuracy:.1%}")
+    print(f"+ Fix 1 (full day)     : {fullday_accuracy:.1%}")
+    print(f"+ Fix 2 (backbone)     : {backbone_accuracy:.1%}")
 
     # the similarity matrix is the one heavy artifact the figures need
     np.save(f"{OUT}/similarity_matrix.npy", similarity_matrix.astype(np.float32))
 
-    return ({"chance": chance, "naive": naive_accuracy, "fix12": fullday_accuracy, "fix123": backbone_accuracy},
+    return ({"chance": chance, "naive": naive_accuracy, "fix1": fullday_accuracy, "fix2": backbone_accuracy},
             day1_deviations, day2_deviations, similarity_matrix)
+
+
+# ===========================================================================
+# PERMUTATION TEST - an empirical chance level for the core result
+# ===========================================================================
+def run_permutation(similarity_matrix: np.ndarray) -> dict:
+    """Compare the core accuracy against a null distribution built by shuffling identities.
+
+    The analytical chance level (1 / N_SUBJECTS) assumes observations are independent and
+    identically distributed, which connectome data can violate. This re-scores the same
+    similarity matrix 5,000 times with the day-2 identities shuffled, giving a data-driven
+    chance distribution and a permutation p-value. Writes null_distribution.npy, which the
+    figures need.
+
+    Args:
+        similarity_matrix: the (N_SUBJECTS, N_SUBJECTS) day-1-vs-day-2 grid from run_core.
+
+    Returns:
+        A dict with the observed accuracy, the permutation p-value, and the null
+        distribution's summary statistics.
+    """
+    print("\n=== PERMUTATION TEST: is the accuracy better than empirical chance? ===")
+    observed_accuracy, null_distribution, permutation_p = permutation_test(similarity_matrix, n_perm=5000)
+
+    print(f"  observed accuracy      : {observed_accuracy:.4f} ({observed_accuracy:.2%})")
+    print(f"  permutation p-value    : {permutation_p:.6f}")
+    print(f"  null: mean {np.mean(null_distribution):.4f}  std {np.std(null_distribution):.4f}  "
+          f"min {np.min(null_distribution):.4f}  max {np.max(null_distribution):.4f}  "
+          f"95th pct {np.percentile(null_distribution, 95):.4f}  ({len(null_distribution)} permutations)")
+
+    np.save(f"{OUT}/null_distribution.npy", null_distribution.astype(np.float32))
+
+    return {"observed_accuracy": float(observed_accuracy), "p_value": permutation_p,
+            "n_perm": int(len(null_distribution)),
+            "null_mean": float(np.mean(null_distribution)), "null_std": float(np.std(null_distribution)),
+            "null_min": float(np.min(null_distribution)), "null_max": float(np.max(null_distribution)),
+            "null_p95": float(np.percentile(null_distribution, 95))}
 
 
 # ===========================================================================
@@ -579,11 +655,13 @@ def run_cross_task() -> dict:
 
 if __name__ == "__main__":
     core_results, day1_deviations, day2_deviations, similarity_matrix = run_core()
+    permutation_results = run_permutation(similarity_matrix)
     network_results = run_networks(day1_deviations, day2_deviations)
     intelligence_results = run_intelligence(similarity_matrix)
     cross_task_results = run_cross_task()
 
     results = {"core": core_results,
+               "permutation": permutation_results,
                "networks": {name: float(acc) for name, acc in network_results.items()},
                "intelligence": intelligence_results,
                "cross_task": cross_task_results}
@@ -591,5 +669,6 @@ if __name__ == "__main__":
         json.dump(results, results_file, indent=2)
 
     print(f"\nDone. Raw results written to ./{OUT}/")
-    print("  results.json, per_network.csv, intelligence.csv, cross_task_grid.csv, similarity_matrix.npy")
+    print("  results.json, per_network.csv, intelligence.csv, cross_task_grid.csv,")
+    print("  similarity_matrix.npy, null_distribution.npy")
     print("Next: run  python visualiser.py  to render the figures.")

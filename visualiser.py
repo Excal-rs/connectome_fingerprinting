@@ -11,11 +11,12 @@ it runs on a fresh clone of the repo in seconds.
 
 Inputs (from ./results):
   results.json, per_network.csv, intelligence.csv,
-  cross_task_grid.csv, similarity_matrix.npy
+  cross_task_grid.csv, similarity_matrix.npy, null_distribution.npy
 
 Outputs (into ./figures):
-  accuracy_climb.png, similarity_matrix.png, similarity_distributions.png,
-  networks.png, intelligence.png, cross_task_grid.png, task_specialisation.png
+  accuracy_climb.png, permutation_null.png, similarity_matrix.png,
+  similarity_distributions.png, networks.png, intelligence.png,
+  cross_task_grid.png, task_specialisation.png
 ============================================================================
 """
 import os, json
@@ -58,6 +59,10 @@ def load_similarity():
     return np.load(f"{IN}/similarity_matrix.npy").astype(float)
 
 
+def load_null_distribution():
+    return np.load(f"{IN}/null_distribution.npy").astype(float)
+
+
 def load_per_network():
     rows = []
     with open(f"{IN}/per_network.csv") as f:
@@ -85,12 +90,12 @@ def load_cross_task_grid():
 # ===========================================================================
 def fig_core(results, S):
     core = results["core"]
-    chance, before, fix12, fix123 = core["chance"], core["naive"], core["fix12"], core["fix123"]
+    chance, before, fix1, fix2 = core["chance"], core["naive"], core["fix1"], core["fix2"]
 
     # ---- figure 1: the climb ----
     fig, ax = plt.subplots(figsize=(7.2, 4.6))
-    labels = ["Naive start\n(single scan)", "+ Fix 1 & 2\n(full-day data)", "+ Fix 3\n(remove generic brain)"]
-    vals, colors = [before, fix12, fix123], [ORANGE, BLUE, GREEN]
+    labels = ["Naive start\n(single scan)", "+ Fix 1\n(full-day data)", "+ Fix 2\n(remove generic brain)"]
+    vals, colors = [before, fix1, fix2], [ORANGE, BLUE, GREEN]
     bars = ax.bar(labels, [v * 100 for v in vals], color=colors, width=0.62, zorder=3)
     for b, v in zip(bars, vals):
         ax.text(b.get_x() + b.get_width() / 2, v * 100 + 1.5, f"{v*100:.1f}%",
@@ -99,7 +104,7 @@ def fig_core(results, S):
     ax.text(2.48, chance * 100 + 1.2, "random guessing (0.3%)", ha="right", va="bottom",
             fontsize=9, color=MUTED, style="italic")
     ax.set_ylim(0, 100); ax.set_ylabel("Identification accuracy (%)")
-    ax.set_title("From 31% to 92%: three fixes to brain fingerprinting", fontweight="bold", pad=12)
+    ax.set_title("From 31% to 92%: two fixes to brain fingerprinting", fontweight="bold", pad=12)
     ax.yaxis.grid(True, color=GRID, lw=0.8, zorder=0); ax.set_axisbelow(True); ax.tick_params(length=0)
     fig.tight_layout(); fig.savefig(f"{OUT}/accuracy_climb.png", dpi=200); plt.close(fig)
 
@@ -125,6 +130,45 @@ def fig_core(results, S):
     ax.legend(frameon=False, loc="upper center"); ax.tick_params(length=0)
     ax.yaxis.grid(True, color=GRID, lw=0.8, zorder=0); ax.set_axisbelow(True)
     fig.tight_layout(); fig.savefig(f"{OUT}/similarity_distributions.png", dpi=200); plt.close(fig)
+
+
+# ===========================================================================
+# PERMUTATION TEST — the empirical null distribution
+# ===========================================================================
+def fig_permutation(results, null_distribution):
+    chance = results["core"]["chance"]
+    perm = results["permutation"]
+    observed_accuracy, p_value = perm["observed_accuracy"], perm["p_value"]
+
+    # ---- figure 4: observed accuracy against the shuffled-identity null ----
+    fig, ax = plt.subplots(figsize=(7.2, 4.6))
+
+    # Histogram of accuracies expected under the null hypothesis
+    ax.hist(null_distribution * 100, bins=30, color=ORANGE, alpha=0.75, edgecolor="white")
+
+    # Analytical chance level
+    ax.axvline(chance * 100, color=MUTED, linestyle="--", linewidth=2,
+               label=f"Analytical chance ({chance*100:.1f}%)")
+
+    # 95th percentile of the empirical null distribution
+    null95 = np.percentile(null_distribution, 95)
+    ax.axvline(null95 * 100, color=BLUE, linestyle=":", linewidth=2,
+               label=f"95th percentile of null ({null95*100:.1f}%)")
+
+    # Observed fingerprinting accuracy
+    ax.axvline(observed_accuracy * 100, color=GREEN, linewidth=4,
+               label=f"Observed accuracy ({observed_accuracy*100:.1f}%)")
+
+    # Annotate statistical significance
+    ax.text(observed_accuracy * 100 - 1.5, ax.get_ylim()[1] * 0.97,
+            f"Permutation\n$p < {p_value:.4f}$", ha="right", va="top",
+            fontsize=10, color=GREEN, fontweight="bold")
+
+    ax.set_xlabel("Identification accuracy (%)"); ax.set_ylabel("Frequency")
+    ax.set_title("Permutation test of connectome fingerprinting accuracy", fontweight="bold", pad=12)
+    ax.grid(axis="y", color=GRID, lw=0.8); ax.set_axisbelow(True); ax.tick_params(length=0)
+    ax.legend(frameon=False, loc="lower center")
+    fig.tight_layout(); fig.savefig(f"{OUT}/permutation_null.png", dpi=200); plt.close(fig)
 
 
 # ===========================================================================
@@ -241,10 +285,11 @@ if __name__ == "__main__":
     iq, self_id, identified = load_intelligence_csv()
 
     fig_core(results, S)
+    fig_permutation(results, load_null_distribution())
     fig_networks(load_per_network())
     fig_intelligence(results, iq, self_id, identified)
     fig_cross_task(results, load_cross_task_grid())
 
     print(f"Done. Figures written to ./{OUT}/")
-    print("  accuracy_climb, similarity_matrix, similarity_distributions,")
+    print("  accuracy_climb, permutation_null, similarity_matrix, similarity_distributions,")
     print("  networks, intelligence, cross_task_grid, task_specialisation  (.png)")
