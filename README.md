@@ -1,6 +1,6 @@
 # Connectome Fingerprinting
 
-**Can you idenitfy a person from thier brains wiring patter?**
+**Can you idenitfy a person from their brains wiring patter?**
 We know everyone's brain is unique, but research (*Finn et al. 2015*, *Nature Neuroscience*) has shown that we can use the patterns of how different regions of the brain activation rise and fall together to create a *stable and personal fingerprint*. We test this on **339 people** from the **HCP dataset**.
 
 ### Core experiment summary
