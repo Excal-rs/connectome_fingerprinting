@@ -111,7 +111,7 @@ data*. Two fixes closed it:
   - **A cancelled scanner artefact.** A day's two scans use *opposite* phase-encoding directions, so combining them cancels the warp instead of letting it fool the match. Comes free with using the whole day.
 - **Fix 2 — subtract the "generic brain."** Everyone is broadly wired the same way; that shared pattern is loud and useless for telling people apart. Subtracting the group-average fingerprint leaves each person's *personal deviation* (89.5% → 91.6%).
 
-**Null-distribution vs Analytical Chance**
+**Null-distribution vs Analytical Chance**  
 The analytical chance level (1/339 ≈ 0.3%) assumes observations are independent and identically distributed, which connectome data can violate. So we also estimate chance *from the data*: shuffle the Day-2 identities, re-score, and repeat **5,000 times**.
 
 ![Observed accuracy against the shuffled-identity null distribution](figures/permutation_null.png)
