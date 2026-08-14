@@ -25,6 +25,76 @@
     "Somatomotor": 0.34513274336283184,
     "Visual2": 0.49262536873156343
   },
+  "regions": {
+    "n_regions": 360,
+    "accuracy_min": 0.38348082595870203,
+    "accuracy_max": 0.915929203539823,
+    "accuracy_mean": 0.6110332677810553,
+    "most_identifying": [
+      {
+        "region": "L_AVI",
+        "network": "Frontopariet",
+        "accuracy": 0.915929203539823,
+        "idiff": 0.5911797230816451
+      },
+      {
+        "region": "R_AVI",
+        "network": "Frontopariet",
+        "accuracy": 0.9070796460176991,
+        "idiff": 0.5903545209855864
+      },
+      {
+        "region": "R_TGd",
+        "network": "Posterior-Mu",
+        "accuracy": 0.8997050147492625,
+        "idiff": 0.5827257795294137
+      },
+      {
+        "region": "L_FOP5",
+        "network": "Cingulo-Oper",
+        "accuracy": 0.8893805309734513,
+        "idiff": 0.5794435464794908
+      },
+      {
+        "region": "R_FOP5",
+        "network": "Cingulo-Oper",
+        "accuracy": 0.8864306784660767,
+        "idiff": 0.5822168251663254
+      }
+    ],
+    "least_identifying": [
+      {
+        "region": "R_V3",
+        "network": "Visual2",
+        "accuracy": 0.38348082595870203,
+        "idiff": 0.1503283572954847
+      },
+      {
+        "region": "R_V4",
+        "network": "Visual2",
+        "accuracy": 0.415929203539823,
+        "idiff": 0.1361127016375989
+      },
+      {
+        "region": "R_V1",
+        "network": "Visual1",
+        "accuracy": 0.42035398230088494,
+        "idiff": 0.1596579110175782
+      },
+      {
+        "region": "L_V3A",
+        "network": "Visual2",
+        "accuracy": 0.4247787610619469,
+        "idiff": 0.15917272445280342
+      },
+      {
+        "region": "L_MIP",
+        "network": "Language",
+        "accuracy": 0.43952802359882004,
+        "idiff": 0.14663871654278415
+      }
+    ]
+  },
   "intelligence": {
     "pearson_r": 0.041251909934238794,
     "pearson_p": 0.44902282138569927,

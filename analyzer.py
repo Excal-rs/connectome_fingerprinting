@@ -4,27 +4,30 @@
  CONNECTOME FINGERPRINTING - ANALYZER (computation only)
 ============================================================================
 Run: `python analyzer.py`
-Prerequisites: `python download.py` must have been ran to download HCP database
+Prerequisites: `python download.py` must have been run to download the HCP dataset
 
 This will run the experiment and return raw result files with no visualisation.
 To visualise results, please see `visualiser.py`.
 
 What it does, start to finish:
   - Brain Fingerprinting
-    - Identify people based on their fmri data across multiple dats (91.6% Accuracy)
+    - Identify people based on their fmri data across multiple days (91.6% Accuracy)
   - Permutation test
     - Estimate the chance level empirically by shuffling subject identities
   - Which brain network is the most identifiable?
     - Runs tests on different higher-order networks to check identifiability of different brain regions
+  - Which single regions are the most identifiable?
+    - The same test one region at a time, giving a 360-region map of where identity lives
   - Cross task identification
     - Compute identifiability using data from one task to identify a person on another task
-  - Intelligience Identifiability Correlation
-    - Check is a persons calculated intelligience correlates with identifiability of that person
+  - Intelligence Identifiability Correlation
+    - Check if a person's calculated intelligence correlates with identifiability of that person
 
 
 Outputs (into ./results):
   results.json          all scalar results + metadata for every analysis
   per_network.csv       identification accuracy per brain network
+  per_region.csv        identification accuracy + MNI coordinates per brain region
   intelligence.csv      per-subject intelligence composite + identifiability
   cross_task_grid.csv   7x7 cross-task identification accuracy grid
   similarity_matrix.npy 339x339 day1-vs-day2 similarity matrix (backbone removed)
@@ -62,7 +65,7 @@ class Task(IntEnum):
     SOCIAL     = 6
 TASKS = [t.name for t in Task]   # ["MOTOR", "WM", ...] for headers/labels/indexing
 
-IU = np.triu_indices(N_REGIONS, k=1)   # Indicies of the 64,620 unique region-pairs, matrix[IU] can be used to extract only the useful fingerprints
+IU = np.triu_indices(N_REGIONS, k=1)   # Indices of the 64,620 unique region-pairs, matrix[IU] can be used to extract only the useful fingerprints
 people = list(range(N_SUBJECTS))
 
 
@@ -91,8 +94,9 @@ REST = require("hcp_rest")
 TASK = require("hcp_task")
 
 regions = np.load(f"{TASK}/regions.npy", allow_pickle=True)
-network_labels = regions[:, 1]                      
-NETWORKS = network_labels.astype(str) # NETWORKS[I] == Network the `i`th region belongs to
+network_labels = regions[:, 1]
+NETWORKS = network_labels.astype(str) # NETWORKS[i] == Network the `i`th region belongs to
+REGION_NAMES = regions[:, 0].astype(str) # REGION_NAMES[i] == Glasser name of the `i`th region, e.g. "R_V1"
 
 
 def load_rest_run(subject: int, run: int) -> np.ndarray:
@@ -156,9 +160,9 @@ def load_intelligence() -> tuple[np.ndarray, dict[str, np.ndarray]]:
 
     Returns:
         A 2-tuple of:
-          - composite: a (length - N_SUBJECTS) array, the averaged cognitive score
+          - composite: a length-N_SUBJECTS array, the averaged cognitive score
             (NaN where a subject is missing data),
-          - subtests: a dict mapping subtest name -> its own (length - N_SUBJECTS) array.
+          - subtests: a dict mapping subtest name -> its own length-N_SUBJECTS array.
     """
     behavior_dir = os.path.join(DATA, "hcp", "behavior")
 
@@ -217,7 +221,7 @@ def fingerprint(timeseries: np.ndarray) -> np.ndarray:
         A 1-D array of 64,620 Fisher-z-transformed correlations - the unique
         region-pair values from the upper triangle. One person, one session.
     """
-    centered = timeseries - timeseries.mean(axis=1, keepdims=True)      # per-region: remove baseline level
+    centered = timeseries - timeseries.mean(axis=1, keepdims=True)      # explicit, though np.corrcoef centres rows itself
     connectome = np.corrcoef(centered)                                  # 360x360 region-by-region correlations
     connectome = np.arctanh(np.clip(connectome, -0.999999, 0.999999))   # Fisher-z rescale (clip keeps arctanh finite)
     return connectome[IU]
@@ -472,6 +476,96 @@ def run_networks(day1_deviations: np.ndarray, day2_deviations: np.ndarray) -> di
 
 
 # ===========================================================================
+# EXTENSION 1b (H3) - the same question at full resolution: per-region identifiability
+# ===========================================================================
+def load_region_coordinates() -> np.ndarray:
+    """Return the MNI centre of each of the 360 regions, from the atlas fetched by download.py.
+
+    Returns:
+        A (N_REGIONS, 3) float array of x/y/z millimetre coordinates, in the same
+        region order as REGION_NAMES and NETWORKS.
+
+    Raises:
+        SystemExit: If data/atlas.npz isn't present yet.
+    """
+    atlas_path = os.path.join(DATA, "atlas.npz")
+    if not os.path.isfile(atlas_path):
+        raise SystemExit(f"Missing {atlas_path}. Run `python download.py` first to fetch the HCP dataset.")
+    return np.load(atlas_path, allow_pickle=True)["coords"]
+
+
+def run_region_map(day1_deviations: np.ndarray, day2_deviations: np.ndarray) -> dict:
+    """Score each of the 360 regions on how well its own connections identify people.
+
+    run_networks asks which of the dozen networks fingerprints best; this asks the same
+    question one region at a time. A region's connections are the 359 fingerprint edges
+    that touch it, so restricting the fingerprint to those edges and re-running
+    identification gives one accuracy per region - a map of where identity lives. Note
+    that those edges still reach across the whole brain: the score says how much a region
+    contributes to identification, not that the region identifies anyone on its own.
+
+    Each region also gets a differential identifiability score - mean same-person
+    similarity minus mean different-person similarity - which keeps varying smoothly
+    at the top of the range, where accuracy starts to saturate.
+
+    Writes per_region.csv, which carries each region's MNI coordinates alongside its
+    scores so the figures can draw the map without ever touching the dataset.
+
+    Args:
+        day1_deviations: (N_SUBJECTS, 64,620) backbone-removed fingerprints, day 1.
+        day2_deviations: the same for day 2.
+
+    Returns:
+        A dict with the range of per-region accuracy and the most / least identifying
+        regions. The full 360-row map goes to per_region.csv.
+    """
+    print("\n=== EXTENSION 1b (H3): identifiability region by region ===")
+    coordinates = load_region_coordinates()
+    off_diagonal = ~np.eye(N_SUBJECTS, dtype=bool)
+
+    region_accuracy = np.zeros(N_REGIONS)
+    region_identifiability = np.zeros(N_REGIONS)
+    for region in range(N_REGIONS):
+        touches_region = (IU[0] == region) | (IU[1] == region)
+        similarity_matrix = similarity(day1_deviations[:, touches_region],
+                                       day2_deviations[:, touches_region])
+        region_accuracy[region] = accuracy(similarity_matrix)
+        region_identifiability[region] = (np.mean(np.diag(similarity_matrix))
+                                          - np.mean(similarity_matrix[off_diagonal]))
+
+    ranked = np.argsort(-region_accuracy)   # most identifying region first
+    print(f"  accuracy spans {region_accuracy.min():.1%} - {region_accuracy.max():.1%} "
+          f"across the {N_REGIONS} regions (whole-brain: uses all 64,620 edges at once)")
+    print("  most identifying:")
+    for region in ranked[:8]:
+        print(f"    {REGION_NAMES[region]:>10s} {NETWORKS[region]:>14s} {region_accuracy[region]:6.1%}"
+              f"  (Idiff {region_identifiability[region]:.3f})")
+    print("  least identifying:")
+    for region in ranked[::-1][:5]:
+        print(f"    {REGION_NAMES[region]:>10s} {NETWORKS[region]:>14s} {region_accuracy[region]:6.1%}"
+              f"  (Idiff {region_identifiability[region]:.3f})")
+
+    with open(f"{OUT}/per_region.csv", "w") as csv_file:
+        csv_file.write("region,network,x,y,z,accuracy,idiff\n")
+        for region in range(N_REGIONS):
+            x, y, z = coordinates[region]
+            csv_file.write(f"{REGION_NAMES[region]},{NETWORKS[region]},{x:.3f},{y:.3f},{z:.3f},"
+                           f"{region_accuracy[region]:.4f},{region_identifiability[region]:.5f}\n")
+
+    def summarise(region: int) -> dict:
+        return {"region": REGION_NAMES[region], "network": NETWORKS[region],
+                "accuracy": float(region_accuracy[region]),
+                "idiff": float(region_identifiability[region])}
+
+    return {"n_regions": N_REGIONS,
+            "accuracy_min": float(region_accuracy.min()),
+            "accuracy_max": float(region_accuracy.max()),
+            "accuracy_mean": float(region_accuracy.mean()),
+            "most_identifying": [summarise(r) for r in ranked[:5]],
+            "least_identifying": [summarise(r) for r in ranked[::-1][:5]]}
+
+
+# ===========================================================================
 # EXTENSION 3 - does a person's intelligence affect how identifiable they are?
 # ===========================================================================
 def compute_self_identifiability(similarity_matrix: np.ndarray) -> np.ndarray:
@@ -657,18 +751,20 @@ if __name__ == "__main__":
     core_results, day1_deviations, day2_deviations, similarity_matrix = run_core()
     permutation_results = run_permutation(similarity_matrix)
     network_results = run_networks(day1_deviations, day2_deviations)
+    region_results = run_region_map(day1_deviations, day2_deviations)
     intelligence_results = run_intelligence(similarity_matrix)
     cross_task_results = run_cross_task()
 
     results = {"core": core_results,
                "permutation": permutation_results,
                "networks": {name: float(acc) for name, acc in network_results.items()},
+               "regions": region_results,
                "intelligence": intelligence_results,
                "cross_task": cross_task_results}
     with open(f"{OUT}/results.json", "w") as results_file:
         json.dump(results, results_file, indent=2)
 
     print(f"\nDone. Raw results written to ./{OUT}/")
-    print("  results.json, per_network.csv, intelligence.csv, cross_task_grid.csv,")
-    print("  similarity_matrix.npy, null_distribution.npy")
+    print("  results.json, per_network.csv, per_region.csv, intelligence.csv,")
+    print("  cross_task_grid.csv, similarity_matrix.npy, null_distribution.npy")
     print("Next: run  python visualiser.py  to render the figures.")

@@ -10,22 +10,26 @@ renders every figure into ./figures. It never touches the 12 GB dataset, so
 it runs on a fresh clone of the repo in seconds.
 
 Inputs (from ./results):
-  results.json, per_network.csv, intelligence.csv,
+  results.json, per_network.csv, per_region.csv, intelligence.csv,
   cross_task_grid.csv, similarity_matrix.npy, null_distribution.npy
 
 Outputs (into ./figures):
   accuracy_climb.png, permutation_null.png, similarity_matrix.png,
-  similarity_distributions.png, networks.png, intelligence.png,
-  cross_task_grid.png, task_specialisation.png
+  similarity_distributions.png, networks.png, region_map.png/.gif,
+  intelligence.png, cross_task_grid.png, task_specialisation.png
 ============================================================================
 """
 import os, json
 import csv
 import numpy as np
+from scipy.spatial import ConvexHull
+from PIL import Image
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from matplotlib.colors import LinearSegmentedColormap
+from matplotlib.cm import ScalarMappable
+from matplotlib.colors import LinearSegmentedColormap, Normalize
+from mpl_toolkits.mplot3d.art3d import Line3DCollection
 
 IN = "results"
 OUT = "figures"
@@ -71,6 +75,11 @@ def load_per_network():
     return rows
 
 
+def load_per_region():
+    with open(f"{IN}/per_region.csv") as f:
+        return list(csv.DictReader(f))
+
+
 def load_intelligence_csv():
     iq, self_id, identified = [], [], []
     with open(f"{IN}/intelligence.csv") as f:
@@ -104,7 +113,7 @@ def fig_core(results, S):
     ax.text(2.48, chance * 100 + 1.2, "random guessing (0.3%)", ha="right", va="bottom",
             fontsize=9, color=MUTED, style="italic")
     ax.set_ylim(0, 100); ax.set_ylabel("Identification accuracy (%)")
-    ax.set_title("From 31% to 92%: two fixes to brain fingerprinting", fontweight="bold", pad=12)
+    ax.set_title("Identification accuracy at each stage of the method", fontweight="bold", pad=12)
     ax.yaxis.grid(True, color=GRID, lw=0.8, zorder=0); ax.set_axisbelow(True); ax.tick_params(length=0)
     fig.tight_layout(); fig.savefig(f"{OUT}/accuracy_climb.png", dpi=200); plt.close(fig)
 
@@ -112,8 +121,8 @@ def fig_core(results, S):
     fig, ax = plt.subplots(figsize=(6.4, 5.4))
     im = ax.imshow(S, cmap=SEQ, aspect="equal", interpolation="nearest")
     ax.set_xlabel("Person's fingerprint — Day 2"); ax.set_ylabel("Person's fingerprint — Day 1")
-    ax.set_title("Each person matches themselves across days\n(bright diagonal = correct matches)",
-                 fontweight="bold", fontsize=12, pad=10); ax.tick_params(length=0)
+    ax.set_title("fMRI fingerprint similarity matrix", fontweight="bold", fontsize=12, pad=10)
+    ax.tick_params(length=0)
     cb = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.03); cb.set_label("Fingerprint similarity", color=INK2)
     cb.outline.set_edgecolor(AXIS); cb.ax.tick_params(color=MUTED, labelcolor=MUTED, length=0)
     fig.tight_layout(); fig.savefig(f"{OUT}/similarity_matrix.png", dpi=200); plt.close(fig)
@@ -126,7 +135,7 @@ def fig_core(results, S):
     ax.hist(within, bins=bins, density=True, color=BLUE, alpha=0.85, label="Same person, different day", zorder=3)
     ax.axvline(between.mean(), color=ORANGE, lw=1.5, ls="--"); ax.axvline(within.mean(), color=BLUE, lw=1.5, ls="--")
     ax.set_xlabel("Fingerprint similarity"); ax.set_ylabel("Relative frequency")
-    ax.set_title("Why it works: your two days look alike; two people don't", fontweight="bold", pad=12)
+    ax.set_title("Within- vs between-subject fingerprint similarity", fontweight="bold", pad=12)
     ax.legend(frameon=False, loc="upper center"); ax.tick_params(length=0)
     ax.yaxis.grid(True, color=GRID, lw=0.8, zorder=0); ax.set_axisbelow(True)
     fig.tight_layout(); fig.savefig(f"{OUT}/similarity_distributions.png", dpi=200); plt.close(fig)
@@ -139,6 +148,11 @@ def fig_permutation(results, null_distribution):
     chance = results["core"]["chance"]
     perm = results["permutation"]
     observed_accuracy, p_value = perm["observed_accuracy"], perm["p_value"]
+
+    # no permutation beat the observed accuracy => p sits at the floor the test can resolve
+    resolution_floor = 1 / (perm["n_perm"] + 1)
+    p_label = (f"$p < {resolution_floor:.4f}$" if p_value <= resolution_floor
+               else f"$p = {p_value:.4f}$")
 
     # ---- figure 4: observed accuracy against the shuffled-identity null ----
     fig, ax = plt.subplots(figsize=(7.2, 4.6))
@@ -161,7 +175,7 @@ def fig_permutation(results, null_distribution):
 
     # Annotate statistical significance
     ax.text(observed_accuracy * 100 - 1.5, ax.get_ylim()[1] * 0.97,
-            f"Permutation\n$p < {p_value:.4f}$", ha="right", va="top",
+            f"Permutation\n{p_label}", ha="right", va="top",
             fontsize=10, color=GREEN, fontweight="bold")
 
     ax.set_xlabel("Identification accuracy (%)"); ax.set_ylabel("Frequency")
@@ -183,9 +197,97 @@ def fig_networks(rows):
     for b, v in zip(bars, vals):
         ax.text(v + 1, b.get_y() + b.get_height() / 2, f"{v:.0f}%", va="center", fontsize=11, color=INK)
     ax.set_xlim(0, 100); ax.set_xlabel("Accuracy using only this network's connections (%)")
-    ax.set_title("Higher-order networks fingerprint best", fontweight="bold", pad=12)
+    ax.set_title("Identification accuracy by brain network", fontweight="bold", pad=12)
     ax.xaxis.grid(True, color=GRID, lw=0.8, zorder=0); ax.set_axisbelow(True); ax.tick_params(length=0)
     fig.tight_layout(); fig.savefig(f"{OUT}/networks.png", dpi=200); plt.close(fig)
+
+
+# ===========================================================================
+# EXTENSION 1b — the same result region by region, as a rotating 3D brain
+# ===========================================================================
+def fig_region_map(rows, n_frames=72, elevation=14):
+    """Draw the 360 regions at their real MNI positions, shaded by how well each identifies people.
+
+    Renders one frame per step of a full turn and writes them as figures/region_map.gif,
+    plus a single still (region_map.png) for anywhere a GIF can't animate.
+    """
+    coordinates = np.array([[float(r["x"]), float(r["y"]), float(r["z"])] for r in rows])
+    accuracies = np.array([float(r["accuracy"]) for r in rows]) * 100
+    region_names = np.array([r["region"] for r in rows])
+
+    centred = coordinates - coordinates.mean(0)
+    normalised_accuracy = (accuracies - accuracies.min()) / np.ptp(accuracies)
+    # a cube this wide holds the brain at every angle, so nothing clips as it turns
+    radius = np.linalg.norm(centred, axis=1).max() * 1.05
+
+    # a wireframe hull per hemisphere, faint but enough to read the cloud as a head
+    hull_edges = []
+    for hemisphere in (centred[coordinates[:, 0] > 0], centred[coordinates[:, 0] < 0]):
+        hull = ConvexHull(hemisphere)
+        edges = {tuple(sorted(pair)) for face in hull.simplices
+                 for pair in ((face[0], face[1]), (face[1], face[2]), (face[0], face[2]))}
+        hull_edges += [[hemisphere[a], hemisphere[b]] for a, b in edges]
+    hull_edges = np.array(hull_edges)
+
+    fig = plt.figure(figsize=(7.0, 5.5), dpi=100)
+    ax = fig.add_subplot(projection="3d")
+    # the axes rect runs off-canvas on purpose: the cube's empty corners spill outside
+    # the frame instead of shrinking the brain, and only the brain itself stays in view
+    ax.set_position([-0.11, -0.02, 1.23, 1.02])
+
+    cax = fig.add_axes([0.30, 0.10, 0.40, 0.022])
+    cb = fig.colorbar(ScalarMappable(norm=Normalize(accuracies.min(), accuracies.max()), cmap=SEQ),
+                      cax=cax, orientation="horizontal")
+    cb.set_label("Identification accuracy using only this region's connections (%)",
+                 fontsize=9, color=INK2, labelpad=6)
+    cb.outline.set_edgecolor(AXIS); cb.outline.set_linewidth(0.6)
+    cb.ax.tick_params(color=MUTED, labelcolor=MUTED, length=0, labelsize=9)
+
+    fig.text(0.5, 0.94, "Identification accuracy by brain region", ha="center",
+             fontsize=15, fontweight="bold", color=INK)
+    caption = fig.text(0.035, 0.16, "", fontsize=9.5, color=MUTED, ha="left")
+
+    side_at_azimuth = [(0, "right"), (90, "front"), (180, "left"), (270, "back"), (360, "right")]
+
+    def draw(azimuth):
+        ax.clear(); ax.set_axis_off()
+        ax.view_init(elev=elevation, azim=azimuth)
+        ax.set_box_aspect((1, 1, 1), zoom=1.55)
+        ax.set_xlim(-radius, radius); ax.set_ylim(-radius, radius); ax.set_zlim(-radius, radius)
+        facing = min(side_at_azimuth, key=lambda side: abs(azimuth % 360 - side[0]))[1]
+        caption.set_text(f"viewing from the {facing}")
+
+        elevation_radians, azimuth_radians = np.radians(elevation), np.radians(azimuth)
+        towards_camera = np.array([np.cos(elevation_radians) * np.cos(azimuth_radians),
+                                   np.cos(elevation_radians) * np.sin(azimuth_radians),
+                                   np.sin(elevation_radians)])
+        depth = centred @ towards_camera
+        nearness = (depth - depth.min()) / np.ptp(depth)
+
+        ax.add_collection3d(Line3DCollection(hull_edges, colors=AXIS, linewidths=0.8, alpha=0.5))
+
+        dot_colors = SEQ(normalised_accuracy)
+        dot_colors[:, 3] = 0.35 + 0.65 * nearness ** 1.2
+        dot_sizes = (16 + 300 * normalised_accuracy ** 1.5) * (0.55 + 0.6 * nearness)
+        back_to_front = np.argsort(depth)
+        ax.scatter(*centred[back_to_front].T, s=dot_sizes[back_to_front], c=dot_colors[back_to_front],
+                   edgecolors=SURFACE, linewidths=0.4, depthshade=False)
+
+    frames = []
+    for azimuth in np.linspace(0, 360, n_frames, endpoint=False):
+        draw(azimuth)
+        fig.canvas.draw()
+        frames.append(Image.frombytes("RGBA", fig.canvas.get_width_height(),
+                                      fig.canvas.buffer_rgba()).convert("RGB"))
+    # one shared palette, or the colours shimmer as the frames cycle
+    palette = frames[0].quantize(colors=192)
+    frames = [f.quantize(palette=palette, dither=Image.Dither.NONE) for f in frames]
+    frames[0].save(f"{OUT}/region_map.gif", save_all=True, append_images=frames[1:],
+                   duration=50, loop=0, optimize=True)
+
+    draw(20)   # near-lateral, the most brain-shaped angle of the turn
+    fig.savefig(f"{OUT}/region_map.png", dpi=200)
+    plt.close(fig)
 
 
 # ===========================================================================
@@ -214,13 +316,14 @@ def fig_intelligence(results, iq, self_id, identified):
             bbox=dict(boxstyle="round,pad=0.4", fc=SURFACE, ec=AXIS, lw=1))
     ax.set_xlabel("Cognitive / intelligence composite (z-scored)")
     ax.set_ylabel("Self-identifiability (SDs above impostors)")
-    ax.set_title("Are more able people more identifiable?", fontweight="bold", pad=12)
+    ax.set_title("Self-identifiability vs cognitive composite", fontweight="bold", pad=12)
     ax.legend(frameon=False, loc="lower right", fontsize=9.5)
     ax.grid(True, color=GRID, lw=0.8, zorder=0); ax.set_axisbelow(True); ax.tick_params(length=0)
 
     # right panel: IQ of correctly-identified vs missed
     parts = [lo, hi] if lo.size else [hi]
-    labels = (["Missed", "Identified"] if lo.size else ["Identified"])
+    labels = ([f"Missed\n(n = {lo.size})", f"Identified\n(n = {hi.size})"] if lo.size
+              else [f"Identified\n(n = {hi.size})"])
     cols = ([ORANGE, BLUE] if lo.size else [BLUE])
     vp = ax2.violinplot(parts, showmeans=True, showextrema=False)
     for body, c in zip(vp["bodies"], cols):
@@ -231,7 +334,8 @@ def fig_intelligence(results, iq, self_id, identified):
         ax2.scatter(jit, data, s=16, color=c, alpha=0.5, zorder=3)
     ax2.set_xticks(range(1, len(labels) + 1)); ax2.set_xticklabels(labels)
     ax2.set_ylabel("Intelligence composite (z)")
-    ax2.set_title(f"Miss rate: {(~hit).sum()}/{valid.sum()}", fontweight="bold", fontsize=11, pad=12)
+    ax2.set_title("Cognitive composite by identification outcome",
+                  fontweight="bold", fontsize=11, pad=12)
     ax2.grid(True, axis="y", color=GRID, lw=0.8, zorder=0); ax2.set_axisbelow(True); ax2.tick_params(length=0)
     fig.tight_layout(); fig.savefig(f"{OUT}/intelligence.png", dpi=200); plt.close(fig)
 
@@ -248,7 +352,7 @@ def fig_cross_task(results, grid):
     ax.set_xticks(range(7)); ax.set_xticklabels(TASKS, rotation=45, ha="right")
     ax.set_yticks(range(7)); ax.set_yticklabels(TASKS)
     ax.set_xlabel("Database task (session B)"); ax.set_ylabel("Query task (session A)")
-    ax.set_title("Identity survives a change of task\n(numbers = % of people correctly identified)",
+    ax.set_title("Cross-task identification matrix\n(numbers = % of people correctly identified)",
                  fontweight="bold", fontsize=12, pad=10)
     for i in range(7):
         for j in range(7):
@@ -271,7 +375,7 @@ def fig_cross_task(results, grid):
                     textcoords="offset points", xytext=(8, 4), fontsize=10, color=INK2)
     ax.set_xlabel("Scan length (timepoints) — i.e. how much data")
     ax.set_ylabel("Within-task identification accuracy (%)")
-    ax.set_title("Identifiability isn't just 'more data'\nHigher-order tasks lead; working-memory lags despite the most data",
+    ax.set_title("Within-task identification accuracy vs scan length",
                  fontweight="bold", fontsize=11.5, pad=12)
     ax.yaxis.grid(True, color=GRID, lw=0.8, zorder=0); ax.set_axisbelow(True); ax.tick_params(length=0)
     ax.margins(0.15)
@@ -287,9 +391,11 @@ if __name__ == "__main__":
     fig_core(results, S)
     fig_permutation(results, load_null_distribution())
     fig_networks(load_per_network())
+    fig_region_map(load_per_region())
     fig_intelligence(results, iq, self_id, identified)
     fig_cross_task(results, load_cross_task_grid())
 
     print(f"Done. Figures written to ./{OUT}/")
     print("  accuracy_climb, permutation_null, similarity_matrix, similarity_distributions,")
-    print("  networks, intelligence, cross_task_grid, task_specialisation  (.png)")
+    print("  networks, region_map, intelligence, cross_task_grid, task_specialisation  (.png)")
+    print("  region_map.gif — the 360-region map as a rotating brain")

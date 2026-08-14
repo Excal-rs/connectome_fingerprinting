@@ -77,6 +77,7 @@ since the results they feed are already baked into the committed `results/`.
 |---|---|
 | `results.json` | every scalar result + metadata for all four analyses |
 | `per_network.csv` | identification accuracy per brain network |
+| `per_region.csv` | identification accuracy + MNI coordinates per brain region (all 360) |
 | `intelligence.csv` | per-subject intelligence composite + identifiability |
 | `cross_task_grid.csv` | 7×7 cross-task identification-accuracy grid |
 | `similarity_matrix.npy` | the 339×339 Day-1-vs-Day-2 similarity matrix |
@@ -84,8 +85,8 @@ since the results they feed are already baked into the committed `results/`.
 
 **`visualiser.py` → `figures/`** (reads `results/` only):
 `accuracy_climb.png`, `permutation_null.png`, `similarity_matrix.png`,
-`similarity_distributions.png`, `networks.png`, `intelligence.png`,
-`cross_task_grid.png`, `task_specialisation.png`.
+`similarity_distributions.png`, `networks.png`, `region_map.gif` (+ a `.png` still),
+`intelligence.png`, `cross_task_grid.png`, `task_specialisation.png`.
 
 ### The method, in four small steps
 
@@ -146,6 +147,25 @@ The **higher-order association networks** (posterior-multimodal 83%, frontoparie
 67% — the systems for flexible, integrative thinking) carry the most identity.
 **Primary sensory/motor networks** (auditory 14%, somatomotor 35%) carry the least.
 The frontoparietal result reproduces Finn et al.'s headline finding.
+
+### The same question, region by region
+
+A dozen networks is a coarse answer, so we ask it again **360 times** — once per
+region, using only the 359 connections that touch that region. Each region is drawn
+at its real position in the brain, shaded by the accuracy it reaches alone:
+
+![Rotating 3D map of per-region identification accuracy](figures/region_map.gif)
+
+Accuracy runs from **38% to 92%** across the 360 regions (mean 61%). The strongest are
+the **anterior insula** (`L_AVI` 92%, `R_AVI` 91%) and the neighbouring **frontal
+operculum** (`FOP5` 89%) and **temporal pole** (`TGd` 90%) — a bilateral hot spot that
+the network-level view smears across three different network labels. The weakest are
+**early visual** regions (`R_V3` 38%, `R_V4` and `R_V1` 42%, `L_V3A` 43%), which see
+roughly the same world in everyone.
+
+Read the numbers as *contribution*, not isolation: a region's 359 connections still
+span the whole brain, so the map says which regions a fingerprint most depends on —
+not that the anterior insula alone identifies you.
 
 ## 3. Does identity survive a change of task? (Extension 2)
 
