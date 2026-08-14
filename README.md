@@ -34,11 +34,27 @@ seconds from the committed `results/`, without running `download.py` at all.
 ├── download.py          STAGE 0 — fetches the HCP dataset from OSF into data/ (run once)
 ├── analyzer.py          STAGE 1 — loads data, runs every experiment, writes raw results
 ├── visualiser.py        STAGE 2 — reads results/, renders every figure (no dataset access)
+├── connectome_fingerprinting.ipynb
+│                        the same pipeline, narrated — every step explained as it runs
 ├── requirements.txt     numpy, scipy, pandas, matplotlib
 ├── results/             raw result files  (committed — small)
 ├── figures/             the figures        (committed)
 └── data/                the 12 GB HCP dataset  (git-ignored; fetched by download.py)
 ```
+
+### Or read it as a walkthrough
+
+`connectome_fingerprinting.ipynb` is the same code told as a story: each step gets an explanation,
+then the code, then the number or figure it produces — from the naive 31% attempt
+through to the extensions. It runs the identical analysis and draws the identical
+figures inline, but writes nothing to disk, so it can't clobber `results/` or
+`figures/`.
+
+It's **self-contained and built for [Google Colab](https://colab.research.google.com/)**:
+it inlines the downloader and needs no other file from this repo, so you can upload
+the single `.ipynb` and run it top to bottom. Nothing to install — Colab already has
+numpy, scipy, pandas and matplotlib. (Colab wipes storage when the runtime
+disconnects, so the ~12 GB fetch repeats each session.)
 
 ### Input files (what `analyzer.py` needs in `data/`)
 
@@ -61,13 +77,16 @@ since the results they feed are already baked into the committed `results/`.
 |---|---|
 | `results.json` | every scalar result + metadata for all four analyses |
 | `per_network.csv` | identification accuracy per brain network |
+| `per_region.csv` | identification accuracy + MNI coordinates per brain region (all 360) |
 | `intelligence.csv` | per-subject intelligence composite + identifiability |
 | `cross_task_grid.csv` | 7×7 cross-task identification-accuracy grid |
 | `similarity_matrix.npy` | the 339×339 Day-1-vs-Day-2 similarity matrix |
+| `null_distribution.npy` | the 5,000 shuffled-identity accuracies (empirical null) |
 
 **`visualiser.py` → `figures/`** (reads `results/` only):
-`accuracy_climb.png`, `similarity_matrix.png`, `similarity_distributions.png`,
-`networks.png`, `intelligence.png`, `cross_task_grid.png`, `task_specialisation.png`.
+`accuracy_climb.png`, `permutation_null.png`, `similarity_matrix.png`,
+`similarity_distributions.png`, `networks.png`, `region_map.gif` (+ a `.png` still),
+`intelligence.png`, `cross_task_grid.png`, `task_specialisation.png`.
 
 ### The method, in four small steps
 
@@ -84,13 +103,26 @@ since the results they feed are already baked into the committed `results/`.
 
 Our first naive attempt scored only **31%** — far above chance, but far below the
 ~90% the literature reaches. The whole gap was in *how carefully we prepared the
-data*. Three fixes closed it:
+data*. Two fixes closed it:
 
 ![Accuracy climb from 31% to 91.6%](figures/accuracy_climb.png)
 
-- **Fix 1 — use more data (the big one).** Each day has *two* scans; a single short one is a blurry snapshot. Gluing both together (~2400 timepoints) gives a sharp fingerprint. This did almost all the work (31% → 89.5%).
-- **Fix 2 — cancel a scanner artefact.** A day's two scans use *opposite* phase-encoding directions, so combining them cancels the warp instead of letting it fool the match. (Comes free with Fix 1.)
-- **Fix 3 — subtract the "generic brain."** Everyone is broadly wired the same way; that shared pattern is loud and useless for telling people apart. Subtracting the group-average fingerprint leaves each person's *personal deviation* (89.5% → 91.6%).
+- **Fix 1 — use a whole day of data (the big one).** This single fix solves *two* problems at once (31% → 89.5%):
+  - **More data.** Each day has *two* scans; a single short one is a blurry snapshot. Gluing both together (~2400 timepoints) gives a sharp fingerprint. This did almost all the work.
+  - **A cancelled scanner artefact.** A day's two scans use *opposite* phase-encoding directions, so combining them cancels the warp instead of letting it fool the match. Comes free with using the whole day.
+- **Fix 2 — subtract the "generic brain."** Everyone is broadly wired the same way; that shared pattern is loud and useless for telling people apart. Subtracting the group-average fingerprint leaves each person's *personal deviation* (89.5% → 91.6%).
+
+**Is 91.6% really beyond chance?** The analytical chance level (1/339 ≈ 0.3%) assumes
+observations are independent and identically distributed, which connectome data can
+violate. So we also estimate chance *from the data*: shuffle the Day-2 identities,
+re-score, and repeat **5,000 times**.
+
+![Observed accuracy against the shuffled-identity null distribution](figures/permutation_null.png)
+
+The null distribution sits where the analytical chance level says it should (mean 0.3%,
+95th percentile 0.9%, best-ever shuffle 1.8%). No permutation came anywhere near the
+observed 91.6%, so the permutation p-value is **< 0.0002** — the ceiling of what 5,000
+permutations can resolve.
 
 The result shows up cleanly as a bright diagonal — everyone matches themselves across days:
 
@@ -100,7 +132,7 @@ The result shows up cleanly as a bright diagonal — everyone matches themselves
 
 ![Within- vs between-subject similarity distributions](figures/similarity_distributions.png)
 
-**Is Fix 3 cheating?** No. The average never looks at *who is who*, and Day 1's
+**Is Fix 2 cheating?** No. The average never looks at *who is who*, and Day 1's
 average uses only Day 1, Day 2's only Day 2 — nothing leaks between the "question"
 and the "answer." Every fix just cleans the data; the brains do the identifying.
 
@@ -115,6 +147,25 @@ The **higher-order association networks** (posterior-multimodal 83%, frontoparie
 67% — the systems for flexible, integrative thinking) carry the most identity.
 **Primary sensory/motor networks** (auditory 14%, somatomotor 35%) carry the least.
 The frontoparietal result reproduces Finn et al.'s headline finding.
+
+### The same question, region by region
+
+A dozen networks is a coarse answer, so we ask it again **360 times** — once per
+region, using only the 359 connections that touch that region. Each region is drawn
+at its real position in the brain, shaded by the accuracy it reaches alone:
+
+![Rotating 3D map of per-region identification accuracy](figures/region_map.gif)
+
+Accuracy runs from **38% to 92%** across the 360 regions (mean 61%). The strongest are
+the **anterior insula** (`L_AVI` 92%, `R_AVI` 91%) and the neighbouring **frontal
+operculum** (`FOP5` 89%) and **temporal pole** (`TGd` 90%) — a bilateral hot spot that
+the network-level view smears across three different network labels. The weakest are
+**early visual** regions (`R_V3` 38%, `R_V4` and `R_V1` 42%, `L_V3A` 43%), which see
+roughly the same world in everyone.
+
+Read the numbers as *contribution*, not isolation: a region's 359 connections still
+span the whole brain, so the map says which regions a fingerprint most depends on —
+not that the anterior insula alone identifies you.
 
 ## 3. Does identity survive a change of task? (Extension 2)
 
@@ -172,8 +223,9 @@ is a real absence, not a failure to look.
 ## Why the numbers are trustworthy
 
 - **Chance baseline** stated everywhere (0.3%); both matching directions agree.
+- **Empirical chance level too:** a 5,000-permutation test confirms the analytical baseline and puts the core result at p < 0.0002.
 - **No leakage:** identity labels are never used to build any transform; Day 1 and Day 2 are processed separately; for cross-task work each person is wholly in the query *or* the database, never split.
-- **Phase-encoding confound** identified and controlled (Fix 2).
+- **Phase-encoding confound** identified and controlled (part of Fix 1).
 - **Confound check for the insight:** the r = −0.01 scan-length control rules out "more data" as the explanation for the specialisation pattern.
 - **Well-powered null:** the intelligence result is reported as a genuine absence — at n = 339 the design has ~80% power to detect even a weak r ≈ 0.15.
 

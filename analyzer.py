@@ -4,28 +4,34 @@
  CONNECTOME FINGERPRINTING - ANALYZER (computation only)
 ============================================================================
 Run: `python analyzer.py`
-Prerequisites: `python download.py` must have been ran to download HCP database
+Prerequisites: `python download.py` must have been run to download the HCP dataset
 
 This will run the experiment and return raw result files with no visualisation.
 To visualise results, please see `visualiser.py`.
 
 What it does, start to finish:
   - Brain Fingerprinting
-    - Identify people based on their fmri data across multiple dats (91.6% Accuracy)
+    - Identify people based on their fmri data across multiple days (91.6% Accuracy)
+  - Permutation test
+    - Estimate the chance level empirically by shuffling subject identities
   - Which brain network is the most identifiable?
     - Runs tests on different higher-order networks to check identifiability of different brain regions
+  - Which single regions are the most identifiable?
+    - The same test one region at a time, giving a 360-region map of where identity lives
   - Cross task identification
     - Compute identifiability using data from one task to identify a person on another task
-  - Intelligience Identifiability Correlation
-    - Check is a persons calculated intelligience correlates with identifiability of that person
+  - Intelligence Identifiability Correlation
+    - Check if a person's calculated intelligence correlates with identifiability of that person
 
 
 Outputs (into ./results):
   results.json          all scalar results + metadata for every analysis
   per_network.csv       identification accuracy per brain network
+  per_region.csv        identification accuracy + MNI coordinates per brain region
   intelligence.csv      per-subject intelligence composite + identifiability
   cross_task_grid.csv   7x7 cross-task identification accuracy grid
   similarity_matrix.npy 339x339 day1-vs-day2 similarity matrix (backbone removed)
+  null_distribution.npy the 5,000 permutation accuracies (empirical null)
 
 See README.md for the full plain-English explanation of every step.
 ============================================================================
@@ -59,7 +65,7 @@ class Task(IntEnum):
     SOCIAL     = 6
 TASKS = [t.name for t in Task]   # ["MOTOR", "WM", ...] for headers/labels/indexing
 
-IU = np.triu_indices(N_REGIONS, k=1)   # Indicies of the 64,620 unique region-pairs, matrix[IU] can be used to extract only the useful fingerprints
+IU = np.triu_indices(N_REGIONS, k=1)   # Indices of the 64,620 unique region-pairs, matrix[IU] can be used to extract only the useful fingerprints
 people = list(range(N_SUBJECTS))
 
 
@@ -88,8 +94,9 @@ REST = require("hcp_rest")
 TASK = require("hcp_task")
 
 regions = np.load(f"{TASK}/regions.npy", allow_pickle=True)
-network_labels = regions[:, 1]                      
-NETWORKS = network_labels.astype(str) # NETWORKS[I] == Network the `i`th region belongs to
+network_labels = regions[:, 1]
+NETWORKS = network_labels.astype(str) # NETWORKS[i] == Network the `i`th region belongs to
+REGION_NAMES = regions[:, 0].astype(str) # REGION_NAMES[i] == Glasser name of the `i`th region, e.g. "R_V1"
 
 
 def load_rest_run(subject: int, run: int) -> np.ndarray:
@@ -153,9 +160,9 @@ def load_intelligence() -> tuple[np.ndarray, dict[str, np.ndarray]]:
 
     Returns:
         A 2-tuple of:
-          - composite: a (length - N_SUBJECTS) array, the averaged cognitive score
+          - composite: a length-N_SUBJECTS array, the averaged cognitive score
             (NaN where a subject is missing data),
-          - subtests: a dict mapping subtest name -> its own (length - N_SUBJECTS) array.
+          - subtests: a dict mapping subtest name -> its own length-N_SUBJECTS array.
     """
     behavior_dir = os.path.join(DATA, "hcp", "behavior")
 
@@ -214,7 +221,7 @@ def fingerprint(timeseries: np.ndarray) -> np.ndarray:
         A 1-D array of 64,620 Fisher-z-transformed correlations - the unique
         region-pair values from the upper triangle. One person, one session.
     """
-    centered = timeseries - timeseries.mean(axis=1, keepdims=True)      # per-region: remove baseline level
+    centered = timeseries - timeseries.mean(axis=1, keepdims=True)      # explicit, though np.corrcoef centres rows itself
     connectome = np.corrcoef(centered)                                  # 360x360 region-by-region correlations
     connectome = np.arctanh(np.clip(connectome, -0.999999, 0.999999))   # Fisher-z rescale (clip keeps arctanh finite)
     return connectome[IU]
@@ -295,21 +302,57 @@ def accuracy(similarity_matrix: np.ndarray) -> float:
     return float((a_to_b + b_to_a) / 2)
 
 
+def permutation_test(similarity_matrix: np.ndarray, n_perm: int = 5000,
+                     seed: int = 42) -> tuple[float, np.ndarray, float]:
+    """Estimate the significance of a fingerprinting accuracy with a permutation test.
+
+    Rather than comparing the observed accuracy only with the analytical chance level
+    (1 / number of subjects), this builds an empirical null distribution directly from
+    the data. Under the null hypothesis that subject identity carries no information,
+    the correspondence between day 1 and day 2 is broken by randomly permuting the
+    columns of the similarity matrix, and the accuracy is recalculated after each
+    shuffle. Repeating this many times gives the distribution of accuracies expected by
+    chance, against which the observed accuracy yields a permutation p-value.
+
+    Args:
+        similarity_matrix: the (N_SUBJECTS, N_SUBJECTS) day-1-vs-day-2 grid.
+        n_perm: number of random permutations used to estimate the null distribution.
+        seed: random seed, for reproducibility.
+
+    Returns:
+        A 3-tuple of:
+          * observed_accuracy: accuracy using the correct subject identities,
+          * null_distribution: a length-n_perm array, the accuracy of each permutation,
+          * p_value: the empirical permutation p-value.
+    """
+    rng = np.random.default_rng(seed)
+    observed_accuracy = accuracy(similarity_matrix)
+    n = similarity_matrix.shape[0]
+
+    null_distribution = np.zeros(n_perm)
+    for i in range(n_perm):
+        shuffled_cols = rng.permutation(n)                  # randomly shuffle day-2 subject identities
+        null_distribution[i] = accuracy(similarity_matrix[:, shuffled_cols])
+
+    p = (1 + np.sum(null_distribution >= observed_accuracy)) / (n_perm + 1)
+    return observed_accuracy, null_distribution, float(p)
+
+
 # ===========================================================================
-# CORE EXPERIMENT - Naive, Fix 1 + 2, Fix 1 + 2 + 3
+# CORE EXPERIMENT - Naive, + Fix 1, + Fix 2
 # ===========================================================================
 def run_core() -> tuple[dict, np.ndarray, np.ndarray, np.ndarray]:
     """Reproduce the core fingerprinting result, from a naive baseline to the full method.
 
     Runs identification three ways on resting-state data and prints each accuracy:
       * naive: a single short scan per session (weak baseline)
-      * Fix 1 & 2: a whole day of rest (both runs concatenated, phase-encoding balanced)
-      * Fix 3: additionally remove the group-average 'backbone' (remove_backbone)
+      * Fix 1: a whole day of rest (both runs concatenated, phase-encoding balanced)
+      * Fix 2: additionally remove the group-average 'backbone' (remove_backbone)
     Also saves the day-1-vs-day-2 similarity matrix, the one heavy artifact the figures need.
 
     Returns:
         A 4-tuple of:
-          * a dict of the four scalar accuracies (chance, naive, fix12, fix123),
+          * a dict of the four scalar accuracies (chance, naive, fix1, fix2),
           * day1_deviations, day2_deviations: the (N_SUBJECTS, 64,620) backbone-removed
             fingerprint tables for each day,
           * similarity_matrix: the (N_SUBJECTS, N_SUBJECTS) day-1-vs-day-2 grid.
@@ -322,12 +365,12 @@ def run_core() -> tuple[dict, np.ndarray, np.ndarray, np.ndarray]:
     naive_accuracy = accuracy(similarity(build(lambda s: load_rest_run(s, 0)),
                                          build(lambda s: load_rest_run(s, 2))))
 
-    # Fix 1 & 2: a full day of data (both runs glued, phase-encoding balanced)
+    # Fix 1: a full day of data (both runs glued, phase-encoding balanced)
     day1_fingerprints = build(lambda s: rest_day(s, 0))
     day2_fingerprints = build(lambda s: rest_day(s, 1))
     fullday_accuracy = accuracy(similarity(day1_fingerprints, day2_fingerprints))
 
-    # Fix 3: also remove the generic brain
+    # Fix 2: also remove the generic brain
     day1_deviations = remove_backbone(day1_fingerprints)
     day2_deviations = remove_backbone(day2_fingerprints)
     similarity_matrix = similarity(day1_deviations, day2_deviations)
@@ -335,14 +378,51 @@ def run_core() -> tuple[dict, np.ndarray, np.ndarray, np.ndarray]:
 
     print(f"chance                 : {chance:.3%}")
     print(f"naive (single scan)    : {naive_accuracy:.1%}")
-    print(f"+ Fix 1 & 2 (full day) : {fullday_accuracy:.1%}")
-    print(f"+ Fix 3 (backbone)     : {backbone_accuracy:.1%}")
+    print(f"+ Fix 1 (full day)     : {fullday_accuracy:.1%}")
+    print(f"+ Fix 2 (backbone)     : {backbone_accuracy:.1%}")
 
     # the similarity matrix is the one heavy artifact the figures need
     np.save(f"{OUT}/similarity_matrix.npy", similarity_matrix.astype(np.float32))
 
-    return ({"chance": chance, "naive": naive_accuracy, "fix12": fullday_accuracy, "fix123": backbone_accuracy},
+    return ({"chance": chance, "naive": naive_accuracy, "fix1": fullday_accuracy, "fix2": backbone_accuracy},
             day1_deviations, day2_deviations, similarity_matrix)
+
+
+# ===========================================================================
+# PERMUTATION TEST - an empirical chance level for the core result
+# ===========================================================================
+def run_permutation(similarity_matrix: np.ndarray) -> dict:
+    """Compare the core accuracy against a null distribution built by shuffling identities.
+
+    The analytical chance level (1 / N_SUBJECTS) assumes observations are independent and
+    identically distributed, which connectome data can violate. This re-scores the same
+    similarity matrix 5,000 times with the day-2 identities shuffled, giving a data-driven
+    chance distribution and a permutation p-value. Writes null_distribution.npy, which the
+    figures need.
+
+    Args:
+        similarity_matrix: the (N_SUBJECTS, N_SUBJECTS) day-1-vs-day-2 grid from run_core.
+
+    Returns:
+        A dict with the observed accuracy, the permutation p-value, and the null
+        distribution's summary statistics.
+    """
+    print("\n=== PERMUTATION TEST: is the accuracy better than empirical chance? ===")
+    observed_accuracy, null_distribution, permutation_p = permutation_test(similarity_matrix, n_perm=5000)
+
+    print(f"  observed accuracy      : {observed_accuracy:.4f} ({observed_accuracy:.2%})")
+    print(f"  permutation p-value    : {permutation_p:.6f}")
+    print(f"  null: mean {np.mean(null_distribution):.4f}  std {np.std(null_distribution):.4f}  "
+          f"min {np.min(null_distribution):.4f}  max {np.max(null_distribution):.4f}  "
+          f"95th pct {np.percentile(null_distribution, 95):.4f}  ({len(null_distribution)} permutations)")
+
+    np.save(f"{OUT}/null_distribution.npy", null_distribution.astype(np.float32))
+
+    return {"observed_accuracy": float(observed_accuracy), "p_value": permutation_p,
+            "n_perm": int(len(null_distribution)),
+            "null_mean": float(np.mean(null_distribution)), "null_std": float(np.std(null_distribution)),
+            "null_min": float(np.min(null_distribution)), "null_max": float(np.max(null_distribution)),
+            "null_p95": float(np.percentile(null_distribution, 95))}
 
 
 # ===========================================================================
@@ -393,6 +473,96 @@ def run_networks(day1_deviations: np.ndarray, day2_deviations: np.ndarray) -> di
             csv_file.write(f"{network},{acc:.4f},{network_edge_count[network]}\n")
 
     return network_accuracy
+
+
+# ===========================================================================
+# EXTENSION 1b (H3) - the same question at full resolution: per-region identifiability
+# ===========================================================================
+def load_region_coordinates() -> np.ndarray:
+    """Return the MNI centre of each of the 360 regions, from the atlas fetched by download.py.
+
+    Returns:
+        A (N_REGIONS, 3) float array of x/y/z millimetre coordinates, in the same
+        region order as REGION_NAMES and NETWORKS.
+
+    Raises:
+        SystemExit: If data/atlas.npz isn't present yet.
+    """
+    atlas_path = os.path.join(DATA, "atlas.npz")
+    if not os.path.isfile(atlas_path):
+        raise SystemExit(f"Missing {atlas_path}. Run `python download.py` first to fetch the HCP dataset.")
+    return np.load(atlas_path, allow_pickle=True)["coords"]
+
+
+def run_region_map(day1_deviations: np.ndarray, day2_deviations: np.ndarray) -> dict:
+    """Score each of the 360 regions on how well its own connections identify people.
+
+    run_networks asks which of the dozen networks fingerprints best; this asks the same
+    question one region at a time. A region's connections are the 359 fingerprint edges
+    that touch it, so restricting the fingerprint to those edges and re-running
+    identification gives one accuracy per region - a map of where identity lives. Note
+    that those edges still reach across the whole brain: the score says how much a region
+    contributes to identification, not that the region identifies anyone on its own.
+
+    Each region also gets a differential identifiability score - mean same-person
+    similarity minus mean different-person similarity - which keeps varying smoothly
+    at the top of the range, where accuracy starts to saturate.
+
+    Writes per_region.csv, which carries each region's MNI coordinates alongside its
+    scores so the figures can draw the map without ever touching the dataset.
+
+    Args:
+        day1_deviations: (N_SUBJECTS, 64,620) backbone-removed fingerprints, day 1.
+        day2_deviations: the same for day 2.
+
+    Returns:
+        A dict with the range of per-region accuracy and the most / least identifying
+        regions. The full 360-row map goes to per_region.csv.
+    """
+    print("\n=== EXTENSION 1b (H3): identifiability region by region ===")
+    coordinates = load_region_coordinates()
+    off_diagonal = ~np.eye(N_SUBJECTS, dtype=bool)
+
+    region_accuracy = np.zeros(N_REGIONS)
+    region_identifiability = np.zeros(N_REGIONS)
+    for region in range(N_REGIONS):
+        touches_region = (IU[0] == region) | (IU[1] == region)
+        similarity_matrix = similarity(day1_deviations[:, touches_region],
+                                       day2_deviations[:, touches_region])
+        region_accuracy[region] = accuracy(similarity_matrix)
+        region_identifiability[region] = (np.mean(np.diag(similarity_matrix))
+                                          - np.mean(similarity_matrix[off_diagonal]))
+
+    ranked = np.argsort(-region_accuracy)   # most identifying region first
+    print(f"  accuracy spans {region_accuracy.min():.1%} - {region_accuracy.max():.1%} "
+          f"across the {N_REGIONS} regions (whole-brain: uses all 64,620 edges at once)")
+    print("  most identifying:")
+    for region in ranked[:8]:
+        print(f"    {REGION_NAMES[region]:>10s} {NETWORKS[region]:>14s} {region_accuracy[region]:6.1%}"
+              f"  (Idiff {region_identifiability[region]:.3f})")
+    print("  least identifying:")
+    for region in ranked[::-1][:5]:
+        print(f"    {REGION_NAMES[region]:>10s} {NETWORKS[region]:>14s} {region_accuracy[region]:6.1%}"
+              f"  (Idiff {region_identifiability[region]:.3f})")
+
+    with open(f"{OUT}/per_region.csv", "w") as csv_file:
+        csv_file.write("region,network,x,y,z,accuracy,idiff\n")
+        for region in range(N_REGIONS):
+            x, y, z = coordinates[region]
+            csv_file.write(f"{REGION_NAMES[region]},{NETWORKS[region]},{x:.3f},{y:.3f},{z:.3f},"
+                           f"{region_accuracy[region]:.4f},{region_identifiability[region]:.5f}\n")
+
+    def summarise(region: int) -> dict:
+        return {"region": REGION_NAMES[region], "network": NETWORKS[region],
+                "accuracy": float(region_accuracy[region]),
+                "idiff": float(region_identifiability[region])}
+
+    return {"n_regions": N_REGIONS,
+            "accuracy_min": float(region_accuracy.min()),
+            "accuracy_max": float(region_accuracy.max()),
+            "accuracy_mean": float(region_accuracy.mean()),
+            "most_identifying": [summarise(r) for r in ranked[:5]],
+            "least_identifying": [summarise(r) for r in ranked[::-1][:5]]}
 
 
 # ===========================================================================
@@ -579,17 +749,22 @@ def run_cross_task() -> dict:
 
 if __name__ == "__main__":
     core_results, day1_deviations, day2_deviations, similarity_matrix = run_core()
+    permutation_results = run_permutation(similarity_matrix)
     network_results = run_networks(day1_deviations, day2_deviations)
+    region_results = run_region_map(day1_deviations, day2_deviations)
     intelligence_results = run_intelligence(similarity_matrix)
     cross_task_results = run_cross_task()
 
     results = {"core": core_results,
+               "permutation": permutation_results,
                "networks": {name: float(acc) for name, acc in network_results.items()},
+               "regions": region_results,
                "intelligence": intelligence_results,
                "cross_task": cross_task_results}
     with open(f"{OUT}/results.json", "w") as results_file:
         json.dump(results, results_file, indent=2)
 
     print(f"\nDone. Raw results written to ./{OUT}/")
-    print("  results.json, per_network.csv, intelligence.csv, cross_task_grid.csv, similarity_matrix.npy")
+    print("  results.json, per_network.csv, per_region.csv, intelligence.csv,")
+    print("  cross_task_grid.csv, similarity_matrix.npy, null_distribution.npy")
     print("Next: run  python visualiser.py  to render the figures.")
