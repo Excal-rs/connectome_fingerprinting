@@ -41,7 +41,7 @@ python visualiser.py   # results/ → figures/   (seconds; no dataset needed)
 
 connectome_fingerprinting.ipynb is the same code told as a story. Every step gets an explanation, followed by the code, and then the exact number or figure it produces, taking you from our naive 31% attempt all the way through to the final extensions. It runs the identical analysis and draws the identical figures inline, but writes nothing to disk so it can't clobber results/ or figures/.
 
-It's **self-contained and built for [Google Colab**](https://colab.research.google.com/): it inlines the downloader and needs no other files from this repo. You can upload the single .ipynb and run it top to bottom. No installations required. Colab already has numpy, scipy, pandas, and matplotlib. *(Note: Colab wipes storage when the runtime disconnects, so the ~12 GB fetch will repeat each session).*
+It's **self-contained** and built for [Google Colab](https://colab.research.google.com/): it inlines the downloader and needs no other files from this repo. You can upload the single .ipynb and run it top to bottom. No installations required. Colab already has numpy, scipy, pandas, and matplotlib. *(Note: Colab wipes storage when the runtime disconnects, so the ~12 GB fetch will repeat each session).*
 
 ### Input files (what analyzer.py needs in data/)
 
