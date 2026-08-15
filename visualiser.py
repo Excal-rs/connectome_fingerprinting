@@ -109,9 +109,10 @@ def fig_core(results, S):
     for b, v in zip(bars, vals):
         ax.text(b.get_x() + b.get_width() / 2, v * 100 + 1.5, f"{v*100:.1f}%",
                 ha="center", va="bottom", fontsize=13, fontweight="bold", color=INK)
-    ax.axhline(chance * 100, ls="--", lw=1.5, color=MUTED, zorder=2)
+    # above the bars (zorder 3), or the line only shows in the gaps between them
+    ax.axhline(chance * 100, ls="--", lw=1.5, color=MUTED, zorder=4)
     ax.text(2.48, chance * 100 + 1.2, "random guessing (0.3%)", ha="right", va="bottom",
-            fontsize=9, color=MUTED, style="italic")
+            fontsize=9, color="black", style="italic", zorder=4)
     ax.set_ylim(0, 100); ax.set_ylabel("Identification accuracy (%)")
     ax.set_title("Identification accuracy at each stage of the method", fontweight="bold", pad=12)
     ax.yaxis.grid(True, color=GRID, lw=0.8, zorder=0); ax.set_axisbelow(True); ax.tick_params(length=0)
@@ -282,8 +283,9 @@ def fig_region_map(rows, n_frames=72, elevation=14):
     # one shared palette, or the colours shimmer as the frames cycle
     palette = frames[0].quantize(colors=192)
     frames = [f.quantize(palette=palette, dither=Image.Dither.NONE) for f in frames]
+    # 70 ms a frame — 72 frames make a ~5 s turn, slow enough to read region by region
     frames[0].save(f"{OUT}/region_map.gif", save_all=True, append_images=frames[1:],
-                   duration=50, loop=0, optimize=True)
+                   duration=70, loop=0, optimize=True)
 
     draw(20)   # near-lateral, the most brain-shaped angle of the turn
     fig.savefig(f"{OUT}/region_map.png", dpi=200)
