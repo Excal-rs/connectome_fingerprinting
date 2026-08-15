@@ -234,7 +234,7 @@ def fig_region_map(rows, n_frames=72, elevation=14):
     ax = fig.add_subplot(projection="3d")
     # the axes rect runs off-canvas on purpose: the cube's empty corners spill outside
     # the frame instead of shrinking the brain, and only the brain itself stays in view
-    ax.set_position([-0.11, -0.02, 1.23, 1.02])
+    ax.set_position([-0.11, 0.035, 1.23, 1.02])
 
     cax = fig.add_axes([0.30, 0.10, 0.40, 0.022])
     cb = fig.colorbar(ScalarMappable(norm=Normalize(accuracies.min(), accuracies.max()), cmap=SEQ),
@@ -246,7 +246,7 @@ def fig_region_map(rows, n_frames=72, elevation=14):
 
     fig.text(0.5, 0.94, "Identification accuracy by brain region", ha="center",
              fontsize=15, fontweight="bold", color=INK)
-    caption = fig.text(0.035, 0.16, "", fontsize=9.5, color=MUTED, ha="left")
+    caption = fig.text(0.035, 0.185, "", fontsize=9.5, color=MUTED, ha="left")
 
     side_at_azimuth = [(0, "right"), (90, "front"), (180, "left"), (270, "back"), (360, "right")]
 
