@@ -17,7 +17,7 @@ We also dug into *which* parts of the brain actually carry identity, how well th
 ---
 
 ### Project structure
-
+```
 ├── download.py          STAGE 0: fetches the HCP dataset from OSF into data/ (run once)
 ├── analyzer.py          STAGE 1: loads data, runs every experiment, writes raw results
 ├── visualiser.py        STAGE 2: reads results/, renders every figure (no dataset access)
@@ -27,6 +27,7 @@ We also dug into *which* parts of the brain actually carry identity, how well th
 ├── results/             raw result files  (committed, small)
 ├── figures/             the figures        (committed)
 └── data/                the 12 GB HCP dataset  (git-ignored; fetched by download.py)
+```
 
 ## How to run it
 ```
